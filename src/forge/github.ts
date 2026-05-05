@@ -1,7 +1,7 @@
 import { request } from 'undici';
 import { execa } from 'execa';
 import type { Config } from '../config.js';
-import type { Forge, PRRef, PRSummary } from './types.js';
+import type { Forge, PRComment, PRRef, PRSummary } from './types.js';
 
 export class GitHubForge implements Forge {
   name = 'github' as const;
@@ -86,6 +86,20 @@ export class GitHubForge implements Forge {
     });
     if (res.statusCode >= 400) throw new Error(`GitHub diff ${ref.number} ${res.statusCode}: ${await res.body.text()}`);
     return await res.body.text();
+  }
+
+  async getComments(ref: PRRef): Promise<PRComment[]> {
+    const url = this.repoUrl(ref, `/pulls/${ref.number}/comments?per_page=100`);
+    const res = await request(url, { headers: await this.headers() });
+    if (res.statusCode >= 400) throw new Error(`GitHub comments ${ref.number} ${res.statusCode}: ${await res.body.text()}`);
+    const data = (await res.body.json()) as any[];
+    return data.map((c) => ({
+      file: c.path ?? '',
+      line: c.line ?? c.original_line ?? 0,
+      side: (c.side === 'LEFT' ? 'old' : 'new') as 'old' | 'new',
+      author: c.user?.login ?? 'unknown',
+      body: c.body ?? '',
+    })).filter((c) => c.file && c.line > 0);
   }
 
   async postInlineComment(

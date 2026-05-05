@@ -68,7 +68,7 @@ export async function triage(provider: Provider, files: FileDiff[], model?: stri
   if (undecided.length === 0) return { items: decided };
 
   const summary = undecided.map((f) =>
-    `- ${f.path}  (+${f.added}/-${f.removed})  hunks:\n${f.body.split('\n').slice(0, 30).join('\n')}`
+    `- ${f.path}  (+${f.added}/-${f.removed})  hunks:\n${f.body.split('\n').slice(0, 10).join('\n')}`
   ).join('\n\n');
 
   const prompt = `You are a triage step for a PR review. Classify each file by review risk.

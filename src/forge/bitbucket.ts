@@ -1,60 +1,122 @@
-import { request } from 'undici';
-import type { Config } from '../config.js';
-import type { Forge, PRRef, PRSummary } from './types.js';
+import { request } from "undici";
+import type { Config } from "../config.js";
+import type { Forge, PRComment, PRRef, PRSummary } from "./types.js";
 
 export class BitbucketForge implements Forge {
-  name = 'bitbucket' as const;
+  name = "bitbucket" as const;
   private auth: string;
   private base: string;
   private username: string;
+  private userUuid: string | undefined;
+  private workspace: string;
   private scope: string;
 
   constructor(cfg: Config) {
-    if (!cfg.bitbucket) throw new Error('bitbucket config missing');
-    this.auth =
-      'Basic ' +
-      Buffer.from(`${cfg.bitbucket.username}:${cfg.bitbucket.appPassword}`).toString('base64');
-    this.base = cfg.bitbucket.baseUrl.replace(/\/$/, '');
-    this.username = cfg.bitbucket.username;
-    this.scope = cfg.bitbucket.scope ?? 'author';
+    if (!cfg.bitbucket) throw new Error("bitbucket config missing");
+    const bb = cfg.bitbucket;
+    if (bb.apiToken) {
+      if (!bb.email)
+        throw new Error("bitbucket.email is required when using apiToken");
+      this.auth =
+        "Basic " + Buffer.from(`${bb.email}:${bb.apiToken}`).toString("base64");
+    } else if (bb.appPassword) {
+      this.auth =
+        "Basic " +
+        Buffer.from(`${bb.username}:${bb.appPassword}`).toString("base64");
+    } else {
+      throw new Error(
+        "bitbucket config requires apiToken (or legacy appPassword)",
+      );
+    }
+    this.base = bb.baseUrl.replace(/\/$/, "");
+    this.username = bb.username;
+    this.userUuid = bb.userUuid;
+    this.workspace = bb.workspace ?? bb.username;
+    this.scope = bb.scope ?? "author";
   }
 
   private headers(extra: Record<string, string> = {}): Record<string, string> {
-    return { Authorization: this.auth, Accept: 'application/json', ...extra };
+    return { Authorization: this.auth, Accept: "application/json", ...extra };
   }
 
   private repoUrl(ref: PRRef, suffix: string): string {
     return `${this.base}/repositories/${ref.owner}/${ref.repo}${suffix}`;
   }
 
+  private async getCurrentUserUuid(): Promise<string> {
+    if (this.userUuid) return this.userUuid;
+    const res = await request(`${this.base}/user`, { headers: this.headers() });
+    if (res.statusCode >= 400)
+      throw new Error(
+        `Bitbucket /user ${res.statusCode}: ${await res.body.text()}`,
+      );
+    const data = (await res.body.json()) as any;
+    return data.uuid;
+  }
+
+  private async fetchAllPages(url: string): Promise<any[]> {
+    const results: any[] = [];
+    let next: string | null = url;
+    while (next) {
+      const res = await request(next, { headers: this.headers() });
+      if (res.statusCode >= 400)
+        throw new Error(
+          `Bitbucket list ${res.statusCode}: ${await res.body.text()}`,
+        );
+      const data = (await res.body.json()) as any;
+      results.push(...(data.values ?? []));
+      next = data.next ?? null;
+    }
+    return results;
+  }
+
+  private async fetchReviewerPRs(uuid: string): Promise<any[]> {
+    const reposUrl = `${this.base}/repositories/${encodeURIComponent(this.workspace)}?pagelen=100&fields=values.slug,next`;
+    const repos = await this.fetchAllPages(reposUrl);
+    const q = encodeURIComponent(`reviewers.uuid="${uuid}" AND state="OPEN"`);
+    const allPRs: any[] = [];
+    await Promise.all(
+      repos.map(async (r: any) => {
+        const url = `${this.base}/repositories/${encodeURIComponent(this.workspace)}/${r.slug}/pullrequests?q=${q}&pagelen=50`;
+        const prs = await this.fetchAllPages(url);
+        allPRs.push(...prs);
+      }),
+    );
+    return allPRs;
+  }
+
   async listOpenPRs(): Promise<PRSummary[]> {
     const s = this.scope.trim();
-    let url: string;
-    if (s === 'author') {
-      url = `${this.base}/pullrequests/${encodeURIComponent(this.username)}?state=OPEN&pagelen=50`;
-    } else if (s === 'reviewer') {
-      throw new Error('bitbucket scope=reviewer is not supported yet (no per-user reviewer endpoint). Use scope=author or repo:ws/name.');
-    } else if (s.startsWith('repo:')) {
-      const [ws, repo] = s.slice(5).split('/');
-      if (!ws || !repo) throw new Error(`bad scope: ${s} (expected repo:ws/name)`);
-      url = `${this.base}/repositories/${ws}/${repo}/pullrequests?state=OPEN&pagelen=50`;
+    let values: any[];
+
+    if (s === "author") {
+      const url = `${this.base}/workspaces/${encodeURIComponent(this.workspace)}/pullrequests/${encodeURIComponent(this.username)}?state=OPEN&pagelen=50`;
+      values = await this.fetchAllPages(url);
+    } else if (s === "reviewer") {
+      const uuid = await this.getCurrentUserUuid();
+      values = await this.fetchReviewerPRs(uuid);
+    } else if (s.startsWith("repo:")) {
+      const [ws, repo] = s.slice(5).split("/");
+      if (!ws || !repo)
+        throw new Error(`bad scope: ${s} (expected repo:ws/name)`);
+      const url = `${this.base}/repositories/${ws}/${repo}/pullrequests?state=OPEN&pagelen=50`;
+      values = await this.fetchAllPages(url);
     } else {
-      throw new Error(`unknown bitbucket scope: ${s} (use author|repo:ws/name)`);
+      throw new Error(
+        `unknown bitbucket scope: ${s} (use author|reviewer|repo:ws/name)`,
+      );
     }
 
-    const res = await request(url, { headers: this.headers() });
-    if (res.statusCode >= 400) throw new Error(`Bitbucket list ${res.statusCode}: ${await res.body.text()}`);
-    const data = (await res.body.json()) as any;
-    return (data.values ?? []).map((v: any) => {
-      const fullName: string = v.destination?.repository?.full_name ?? '';
-      const [owner, repo] = fullName.split('/');
+    return values.map((v: any) => {
+      const fullName: string = v.destination?.repository?.full_name ?? "";
+      const [owner, repo] = fullName.split("/");
       return {
-        ref: { forge: 'bitbucket' as const, owner, repo, number: v.id },
+        ref: { forge: "bitbucket" as const, owner, repo, number: v.id },
         title: v.title,
-        author: v.author?.display_name ?? 'unknown',
+        author: v.author?.display_name ?? "unknown",
         state: v.state,
-        sourceBranch: v.source?.branch?.name ?? '',
-        destBranch: v.destination?.branch?.name ?? '',
+        sourceBranch: v.source?.branch?.name ?? "",
+        destBranch: v.destination?.branch?.name ?? "",
         updatedOn: v.updated_on,
         url: v.links?.html?.href,
       };
@@ -62,27 +124,71 @@ export class BitbucketForge implements Forge {
   }
 
   async getDiff(ref: PRRef): Promise<string> {
-    const res = await request(this.repoUrl(ref, `/pullrequests/${ref.number}/diff`), {
-      headers: this.headers(),
-    });
-    if (res.statusCode >= 400) throw new Error(`Bitbucket diff ${ref.number} ${res.statusCode}: ${await res.body.text()}`);
-    return await res.body.text();
+    let url = this.repoUrl(ref, `/pullrequests/${ref.number}/diff`);
+    // Follow up to 3 redirects (Bitbucket returns 302 for diff downloads)
+    for (let i = 0; i < 3; i++) {
+      const res = await request(url, {
+        headers: this.headers(),
+        maxRedirections: 0,
+      });
+      if (
+        res.statusCode === 301 ||
+        res.statusCode === 302 ||
+        res.statusCode === 307 ||
+        res.statusCode === 308
+      ) {
+        await res.body.dump();
+        url = res.headers.location as string;
+        continue;
+      }
+      if (res.statusCode >= 400)
+        throw new Error(
+          `Bitbucket diff ${ref.number} ${res.statusCode}: ${await res.body.text()}`,
+        );
+      return await res.body.text();
+    }
+    throw new Error(`Bitbucket diff ${ref.number}: too many redirects`);
+  }
+
+  async getComments(ref: PRRef): Promise<PRComment[]> {
+    const url = this.repoUrl(
+      ref,
+      `/pullrequests/${ref.number}/comments?pagelen=100`,
+    );
+    const data = await this.fetchAllPages(url);
+    return data
+      .filter((c: any) => c.inline)
+      .map((c: any) => ({
+        file: c.inline.path ?? "",
+        line: c.inline.to ?? c.inline.from ?? 0,
+        side: (c.inline.to != null ? "new" : "old") as "old" | "new",
+        author: c.author?.display_name ?? "unknown",
+        body: c.content?.raw ?? "",
+      }))
+      .filter((c) => c.file && c.line > 0);
   }
 
   async postInlineComment(
     ref: PRRef,
     file: string,
     line: number,
-    side: 'old' | 'new',
+    side: "old" | "new",
     body: string,
   ): Promise<unknown> {
-    const inline = side === 'old' ? { path: file, from: line } : { path: file, to: line };
-    const res = await request(this.repoUrl(ref, `/pullrequests/${ref.number}/comments`), {
-      method: 'POST',
-      headers: this.headers({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ content: { raw: body }, inline }),
-    });
-    if (res.statusCode >= 400) throw new Error(`Bitbucket comment ${res.statusCode}: ${await res.body.text()}`);
+    const inline =
+      side === "old" ? { path: file, from: line } : { path: file, to: line };
+    const res = await request(
+      this.repoUrl(ref, `/pullrequests/${ref.number}/comments`),
+      {
+        method: "POST",
+        headers: this.headers({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ content: { raw: body }, inline }),
+      },
+    );
+    if (res.statusCode >= 400)
+      throw new Error(
+        `Bitbucket comment ${res.statusCode}: ${await res.body.text()}`,
+      );
     return await res.body.json();
   }
 }

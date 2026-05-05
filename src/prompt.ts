@@ -1,4 +1,4 @@
-import type { ReviewInput } from './providers/types.js';
+import type { ExistingComment, ReviewInput } from './providers/types.js';
 import type { LensRelevance } from './lens_detect.js';
 
 // ── Lens definitions ──────────────────────────────────────────────
@@ -125,6 +125,17 @@ Output ONLY a single JSON object matching this schema:
 }`;
 }
 
+// ── Existing comments block ───────────────────────────────────────
+
+function buildExistingCommentsBlock(comments?: ExistingComment[]): string {
+  if (!comments || comments.length === 0) return '';
+  const lines = comments.map(
+    (c) => `- ${c.file}:${c.line} (${c.side}, @${c.author}): ${c.body.replace(/\n/g, ' ')}`,
+  );
+  return `\n\n## Existing review comments (already posted — do NOT duplicate these)
+${lines.join('\n')}`;
+}
+
 // ── Public API ─────────────────────────────────────────────────────
 
 export function buildPrompt(
@@ -147,6 +158,8 @@ export function buildPrompt(
     ? `\n\n## File context (imports / top-level symbols, post-change)\n${input.contextBlock}`
     : '';
 
+  const existingBlock = buildExistingCommentsBlock(input.existingComments);
+
   const body = `${systemRules}
 
 ## PR
@@ -155,7 +168,7 @@ Description: ${input.prDescription || '(none)'}
 
 ## Changed files
 ${filesList}
-${skills}${ctx}
+${skills}${ctx}${existingBlock}
 
 ## Diff
 \`\`\`diff

@@ -17,10 +17,14 @@ export class GeminiProvider implements Provider {
 
   async review(input: ReviewInput, opts: ReviewOpts = {}): Promise<ReviewOutput> {
     const prompt = input.prompt && input.prompt.length > 0 ? input.prompt : buildPrompt('gemini', input, input.lenses);
-    const args = ['-p', prompt];
+    // Pass prompt via stdin to avoid OS ARG_MAX limits for large diffs.
+    // -p '' triggers headless mode; the CLI appends that empty string to stdin content.
+    // --approval-mode plan = read-only agent mode: no file writes, exits cleanly after responding.
+    const args = ['-p', '', '--approval-mode', 'plan'];
     if (opts.model) args.push('--model', opts.model);
     const { stdout } = await execa(this.bin, args, {
-      timeout: 5 * 60_000,
+      input: prompt,
+      timeout: 10 * 60_000,
       maxBuffer: 50 * 1024 * 1024,
     });
     const usage = {

@@ -5,6 +5,7 @@
 ---
 
 ## 📑 Table of Contents
+
 1. [📥 Installation & Prerequisites](#1-installation--prerequisites)
 2. [🚀 Getting Started (step-by-step)](#2-getting-started-step-by-step)
    - [2.1 Install a provider CLI](#21-install-a-provider-cli)
@@ -31,25 +32,29 @@
 ## 1. Installation & Prerequisites
 
 ### Requirements
+
 - **Node.js 20+**
 - **At least one provider CLI** authenticated and on your `PATH`:
 
-| Provider | Binary | Install | Recommended for |
-| :--- | :--- | :--- | :--- |
+| Provider    | Binary   | Install                                    | Recommended for        |
+| :---------- | :------- | :----------------------------------------- | :--------------------- |
 | Claude Code | `claude` | [claude.com/code](https://claude.com/code) | best overall reasoning |
-| Gemini CLI | `gemini` | Google's `gemini` CLI | large context, fast |
+| Gemini CLI  | `gemini` | Google's `gemini` CLI                      | large context, fast    |
 
 ### Install Lens
 
 **Easiest path — one command:**
+
 ```bash
 git clone <this repo>
 cd do-more-agent
 ./bootstrap.sh
 ```
+
 That installs deps, builds, links the `lens` command globally, and drops you into the interactive setup. Skip ahead to §2.5 if you take this path.
 
 **Step-by-step** (if you want to control each phase):
+
 ```bash
 git clone <this repo>
 cd do-more-agent
@@ -72,6 +77,7 @@ Five steps, ~10 minutes from a fresh laptop to your first review. Do them in ord
 Lens does **not** call LLM APIs directly — it shells out to the AI CLI you've already authenticated. Pick **one** to start; you can add more later and switch with `--provider`.
 
 #### Claude Code
+
 The recommended default. Best reasoning for code review.
 
 ```bash
@@ -91,6 +97,7 @@ claude --version
 Docs: <https://docs.claude.com/en/docs/claude-code>
 
 #### Gemini CLI
+
 Google's open-source CLI. Large context window, fast.
 
 ```bash
@@ -106,6 +113,7 @@ gemini --version
 Docs: <https://github.com/google-gemini/gemini-cli>
 
 #### Codex CLI
+
 OpenAI's terminal coding agent (uses your ChatGPT or API account).
 
 ```bash
@@ -133,17 +141,21 @@ Docs: <https://github.com/openai/codex>
 Lens needs read access to PRs (and write access if you want it to post your curated review).
 
 #### GitHub
+
 You have three options — pick one.
 
 **Option A — `gh` CLI (easiest, recommended):**
+
 ```bash
 brew install gh         # or: https://cli.github.com
 gh auth login           # follow prompts: GitHub.com → HTTPS → browser
 gh auth status          # confirm "Logged in"
 ```
+
 Lens auto-detects `gh` credentials. Nothing else to configure.
 
 **Option B — Fine-grained Personal Access Token:**
+
 1. Go to <https://github.com/settings/personal-access-tokens/new>.
 2. **Token name**: `lens`
 3. **Repository access**: All repositories (or pick specific ones).
@@ -158,24 +170,37 @@ Lens auto-detects `gh` credentials. Nothing else to configure.
 **Option C — Classic PAT** (works but less granular): <https://github.com/settings/tokens> → "Generate new token (classic)" → scopes: `repo`. Same usage as Option B.
 
 #### Bitbucket Cloud
-Bitbucket uses **app passwords**, not OAuth tokens.
 
-1. Go to <https://bitbucket.org/account/settings/app-passwords/>.
-2. Click **Create app password**.
-3. **Label**: `lens`
-4. **Permissions** — tick at minimum:
-   - **Account** → Read
-   - **Workspace membership** → Read
-   - **Repositories** → Read
-   - **Pull requests** → Read **and Write** (Write is needed to post review)
-5. Click **Create**, copy the password (shown **only once**).
-6. Note your Bitbucket **username** (not your email — find it at <https://bitbucket.org/account/settings/>).
-7. Both go into `~/.lens/config.json` under `bitbucket.username` and `bitbucket.appPassword` (see §2.4).
+> **Note:** Bitbucket deprecated app passwords in September 2025. Lens now uses **Atlassian API tokens** authenticated with your email address.
 
-> [!WARNING]
-> App passwords are shown exactly once. If you lose it, revoke and create a new one — they cannot be retrieved.
+**Step 1 — Create an API token**
+
+1. Go to <https://id.atlassian.com/manage-profile/security/api-tokens>.
+2. Click **Create API token**.
+3. Give it a label, e.g. `lens`.
+4. Under **Bitbucket scopes**, tick at minimum:
+   - **Repositories** → Read _(needed to list repos when using `scope: reviewer`)_
+   - **Pull requests** → Read **and** Write _(Write is needed to post review comments)_
+5. Click **Create** and copy the token — it starts with `ATATT` and is shown **only once**.
+
+**Step 2 — Find your Atlassian email and Bitbucket username**
+
+- **Email**: the address you log into Atlassian with (e.g. `you@company.com`). Find it at <https://id.atlassian.com/manage-profile>.
+- **Username**: your short Bitbucket handle (not your email). Find it at <https://bitbucket.org/account/settings/> under _Username_.
+- **Workspace**: the workspace slug shown in your Bitbucket repo URLs, e.g. `bitbucket.org/{workspace}/...`.
+
+**Step 3 — Find your user UUID** _(only needed for `scope: reviewer`)_
+
+Your UUID is the unique identifier Bitbucket uses internally. You can find it by visiting your Bitbucket profile — it appears in the URL as `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}` (with curly braces). Include the braces in your config.
+
+**Step 4 — Add to config**
+
+Put the token, email, username, workspace, and UUID into `~/.lens/config.json` (see §2.4 for the full config example).
+
+> **Tip:** The API token is shown only once. Copy it immediately and store it somewhere safe before closing the dialog.
 
 #### Bitbucket Server / Data Center (self-hosted)
+
 Use a **Personal Access Token** from your profile → **Manage account** → **Personal access tokens** with `PROJECT_READ` and `REPO_WRITE` scopes. Configuration is the same as Bitbucket Cloud but with a `baseUrl` field — see the example in §2.4.
 
 ---
@@ -187,6 +212,7 @@ lens init
 ```
 
 This:
+
 - Creates `~/.lens/` (your config + database directory).
 - Writes a starter `~/.lens/config.json`.
 - Initializes an empty SQLite DB at `~/.lens/lens.db`.
@@ -206,55 +232,61 @@ $EDITOR ~/.lens/config.json     # or: code ~/.lens/config.json
 Fill in the relevant section based on §2.1 and §2.2 choices.
 
 **Example — GitHub + Claude:**
+
 ```jsonc
 {
   "forge": "github",
   "github": {
-    "token": "",                          // empty = use gh CLI / $GITHUB_TOKEN
-    "scope": "reviewer"                   // see scopes table below
+    "token": "", // empty = use gh CLI / $GITHUB_TOKEN
+    "scope": "reviewer", // see scopes table below
   },
   "provider": { "default": "claude" },
-  "reviewer": { "name": "Harshad Naik" }
+  "reviewer": { "name": "Harshad Naik" },
 }
 ```
 
 **Example — Bitbucket Cloud + Gemini:**
+
 ```jsonc
 {
   "forge": "bitbucket",
   "bitbucket": {
-    "username": "harshadnaik",
-    "appPassword": "ATBBxxxxxxxxxxxxxxxx",
-    "scope": "author"
+    "username": "harshadnaik", // your Bitbucket short handle
+    "email": "you@company.com", // your Atlassian login email
+    "apiToken": "ATATT3x...", // token from id.atlassian.com
+    "workspace": "myworkspace", // workspace slug from repo URLs
+    "userUuid": "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}", // from your Bitbucket profile URL
+    "scope": "reviewer", // "author" | "reviewer" | "repo:ws/name"
   },
   "provider": { "default": "gemini" },
-  "reviewer": { "name": "Harshad Naik" }
+  "reviewer": { "name": "Harshad Naik" },
 }
 ```
 
 **Example — Bitbucket Server + Codex:**
+
 ```jsonc
 {
   "forge": "bitbucket",
   "bitbucket": {
     "baseUrl": "https://bitbucket.mycorp.com",
     "username": "hnaik",
-    "appPassword": "BBDC-xxxxxxxxxxxxx",
-    "scope": "reviewer"
+    "appPassword": "BBDC-xxxxxxxxxxxxx", // Data Center still uses PATs
+    "scope": "reviewer",
   },
   "provider": { "default": "codex" },
-  "reviewer": { "name": "Harshad Naik" }
+  "reviewer": { "name": "Harshad Naik" },
 }
 ```
 
 #### Discovery scopes
 
-| Scope | Meaning |
-| :--- | :--- |
-| `reviewer` | PRs that have requested **your** review (across every repo you can see). |
-| `author` | PRs **you opened**. |
-| `org:NAME` (GitHub) | All open PRs in an org. |
-| `repo:owner/name` (GitHub) | One specific repo. |
+| Scope                      | Meaning                                                                  |
+| :------------------------- | :----------------------------------------------------------------------- |
+| `reviewer`                 | PRs that have requested **your** review (across every repo you can see). |
+| `author`                   | PRs **you opened**.                                                      |
+| `org:NAME` (GitHub)        | All open PRs in an org.                                                  |
+| `repo:owner/name` (GitHub) | One specific repo.                                                       |
 
 > [!IMPORTANT]
 > `reviewer` is global — it works across every repo your token can see. You don't need to pre-list repos. This is the main reason Lens stays "zero-integration" — there's nothing to wire up per-repo.
@@ -304,24 +336,24 @@ Most users keep `lens serve` running in a terminal pane next to their editor and
 
 ## 4. Commands Reference
 
-| Command | What it does |
-| :--- | :--- |
-| `lens list` | Sync open PRs into the local DB. |
-| `lens analyze <id>` | Run Triage → Review → Critic. |
-| `lens analyze <id> --re` | Re-run AI review, **keep** your manual edits and rejections. |
-| `lens analyze <id> --effort high` | Use the strongest models available (Opus / Pro). |
-| `lens analyze <id> --no-critic` | Skip the self-critique pass (cheaper, noisier). |
-| `lens analyze <id> --no-triage` | Review every file, even lockfiles (rarely useful). |
-| `lens serve` | Launch the curation UI on `http://localhost:7777`. |
-| `lens serve --port 8080` | Use a different port. |
-| `lens usage` | Per-provider summary (calls, tokens, cost). |
-| `lens usage --by-pr` | Per-PR token + cost breakdown. |
-| `lens usage --by-stage` | Per-stage (triage / review / critic) breakdown. |
-| `lens diff` | Print AI-original vs final body for every comment. |
-| `lens diff --pr <id>` | Limit the diff view to one PR. |
-| `lens diff --only-edited` | Hide untouched comments — show only what you edited or rejected. |
-| `lens export-eval` | Dump the full eval log as JSONL. |
-| `lens export-eval --out file.jsonl` | Write to a file. |
+| Command                             | What it does                                                     |
+| :---------------------------------- | :--------------------------------------------------------------- |
+| `lens list`                         | Sync open PRs into the local DB.                                 |
+| `lens analyze <id>`                 | Run Triage → Review → Critic.                                    |
+| `lens analyze <id> --re`            | Re-run AI review, **keep** your manual edits and rejections.     |
+| `lens analyze <id> --effort high`   | Use the strongest models available (Opus / Pro).                 |
+| `lens analyze <id> --no-critic`     | Skip the self-critique pass (cheaper, noisier).                  |
+| `lens analyze <id> --no-triage`     | Review every file, even lockfiles (rarely useful).               |
+| `lens serve`                        | Launch the curation UI on `http://localhost:7777`.               |
+| `lens serve --port 8080`            | Use a different port.                                            |
+| `lens usage`                        | Per-provider summary (calls, tokens, cost).                      |
+| `lens usage --by-pr`                | Per-PR token + cost breakdown.                                   |
+| `lens usage --by-stage`             | Per-stage (triage / review / critic) breakdown.                  |
+| `lens diff`                         | Print AI-original vs final body for every comment.               |
+| `lens diff --pr <id>`               | Limit the diff view to one PR.                                   |
+| `lens diff --only-edited`           | Hide untouched comments — show only what you edited or rejected. |
+| `lens export-eval`                  | Dump the full eval log as JSONL.                                 |
+| `lens export-eval --out file.jsonl` | Write to a file.                                                 |
 
 ---
 
@@ -336,18 +368,21 @@ Most users keep `lens serve` running in a terminal pane next to their editor and
 ```
 
 ### Effort levels
+
 `--effort` is the simplest dial — it picks model tiers under the hood.
 
-| Level | Triage | Review | Critic | Use when |
-| :--- | :--- | :--- | :--- | :--- |
-| `low` | Haiku | Haiku | Haiku | quick once-over, throwaway PRs |
-| `medium` *(default)* | Haiku | Sonnet | Haiku | day-to-day reviews |
-| `high` | Sonnet | Opus | Sonnet | gnarly PRs, critical paths |
+| Level                | Triage | Review | Critic | Use when                       |
+| :------------------- | :----- | :----- | :----- | :----------------------------- |
+| `low`                | Haiku  | Haiku  | Haiku  | quick once-over, throwaway PRs |
+| `medium` _(default)_ | Haiku  | Sonnet | Haiku  | day-to-day reviews             |
+| `high`               | Sonnet | Opus   | Sonnet | gnarly PRs, critical paths     |
 
 You can also override individual stages in `config.json` if the presets aren't quite right.
 
 ### The "lenses"
+
 Each review pass runs through several lenses, in order:
+
 - **correctness** — bugs, off-by-ones, null handling
 - **security** — injection, auth bypass, secret leakage
 - **data_integrity** — race conditions, missing transactions, schema drift
@@ -376,6 +411,7 @@ lens analyze <id> --re
 ```
 
 This re-runs Triage → Review → Critic but **preserves**:
+
 - comments you edited (kept as your edited body)
 - comments you rejected (stay rejected, with their reason)
 - comments you added manually (untouched)
@@ -387,10 +423,12 @@ New AI suggestions land alongside the curated set.
 ## 8. Tokens, Cost & The Style Corpus
 
 ### Per-stage cost visibility
+
 Lens logs every provider call with `stage`, `model`, `tokens_in`, `tokens_out`, `ms_elapsed`, and an estimated `cost_usd` (using a static price table). Click the cost badge in the AI Summary footer in the UI to see a per-stage breakdown for that PR — useful for spotting which lens is dominating spend.
 
 ### The style corpus
-The diff between `ai_original_body` (what the model said) and `current_body` (what you submitted) is the most valuable thing Lens captures — it's a record of how you turn AI suggestions into *your* voice.
+
+The diff between `ai_original_body` (what the model said) and `current_body` (what you submitted) is the most valuable thing Lens captures — it's a record of how you turn AI suggestions into _your_ voice.
 
 ```bash
 lens diff --only-edited     # see exactly what you reframed
@@ -405,23 +443,26 @@ That JSONL is structured for downstream use: future fine-tuning, few-shot prompt
 
 Lens is intentionally small. Concrete numbers from typical use:
 
-| Scenario | RAM | CPU | Network |
-| :--- | :--- | :--- | :--- |
-| `lens serve` idle (browser tab closed) | 60–80 MB | ~0% | none |
-| `lens serve` with the UI open | 80–100 MB | <1% | localhost only |
-| `lens analyze` running | 120–200 MB peak | variable (intensive while the provider CLI is active) | diff fetch + provider's LLM calls |
-| Doing nothing (no commands running) | **0 MB** | **0%** | **none** |
+| Scenario                               | RAM             | CPU                                                   | Network                           |
+| :------------------------------------- | :-------------- | :---------------------------------------------------- | :-------------------------------- |
+| `lens serve` idle (browser tab closed) | 60–80 MB        | ~0%                                                   | none                              |
+| `lens serve` with the UI open          | 80–100 MB       | <1%                                                   | localhost only                    |
+| `lens analyze` running                 | 120–200 MB peak | variable (intensive while the provider CLI is active) | diff fetch + provider's LLM calls |
+| Doing nothing (no commands running)    | **0 MB**        | **0%**                                                | **none**                          |
 
 ### Is `lens serve` always running?
+
 No — it's a foreground process you start with `lens serve` and stop with `Ctrl+C`. There is no auto-start, no daemon, no launchd/systemd unit, no menu-bar app. If you want it always-available, run it in a `tmux`/`screen` pane or a persistent terminal tab; otherwise spin it up only when you're reviewing.
 
 When it **is** running, it's just a Node HTTP server bound to `localhost` reading from a SQLite file — comparable footprint to having a single browser tab idle.
 
 ### Disk
+
 - Code + deps after `npm install`: ~80 MB in `node_modules` + ~5 MB compiled `dist/`
 - `~/.lens/lens.db`: ~50–500 KB per analyzed PR; grows linearly with PRs analyzed. Vacuum or delete the file at any time — Lens will recreate it.
 
 ### Provider cost
+
 Lens itself doesn't charge anything. Token cost is whatever your provider charges; check `lens usage` for the running tally.
 
 ---
@@ -431,15 +472,15 @@ Lens itself doesn't charge anything. Token cost is whatever your provider charge
 > [!WARNING]
 > If comments appear on the wrong lines after submission, the diff probably changed (force-push, rebase). Run `lens analyze <id> --re` to resync.
 
-| Symptom | Resolution |
-| :--- | :--- |
-| `provider X not found` | Make sure the CLI is on `PATH` and authenticated. |
-| `GitHub token not found` | Run `gh auth login`, or set `$GITHUB_TOKEN`, or put a token in `config.json`. |
+| Symptom                            | Resolution                                                                          |
+| :--------------------------------- | :---------------------------------------------------------------------------------- |
+| `provider X not found`             | Make sure the CLI is on `PATH` and authenticated.                                   |
+| `GitHub token not found`           | Run `gh auth login`, or set `$GITHUB_TOKEN`, or put a token in `config.json`.       |
 | `UI shows no analysis for this PR` | Run `lens analyze <id>` first — `lens serve` only renders what's already in SQLite. |
-| `port 7777 in use` | `lens serve --port 8080` |
-| Comments off by a line | The PR diff changed since analysis — `lens analyze <id> --re`. |
-| Lens feels slow | Try `--effort low` for first-pass, `--no-critic` to skip the second model pass. |
-| Want to start fresh | `rm ~/.lens/lens.db` — Lens will recreate it on next run. |
+| `port 7777 in use`                 | `lens serve --port 8080`                                                            |
+| Comments off by a line             | The PR diff changed since analysis — `lens analyze <id> --re`.                      |
+| Lens feels slow                    | Try `--effort low` for first-pass, `--no-critic` to skip the second model pass.     |
+| Want to start fresh                | `rm ~/.lens/lens.db` — Lens will recreate it on next run.                           |
 
 ---
 

@@ -247,17 +247,17 @@ function renderIndex(db: ReturnType<typeof getDb>): string {
     groups.get(key)!.push(r);
   }
   const sections = [...groups.entries()].map(([repo, list]) => {
-    const items = list.map((r) => `<tr>
+    const items = list.map((r) => `<tr data-search="${escape((r.title ?? '') + ' ' + (r.author ?? '') + ' ' + (r.source_branch ?? '') + ' ' + (r.dest_branch ?? '') + ' ' + (r.number ?? r.id)).toLowerCase()}">
       <td style="width: 80px; font-family: var(--mono); color: var(--fg-muted); font-size: 12px;">#${r.number ?? r.id}</td>
-      <td><a href="/pr/${r.id}">${escape(r.title ?? '')}</a></td>
+      <td><a href="/pr/${r.id}" style="font-weight: 500;">${escape(r.title ?? '')}</a></td>
       <td style="font-size: 13px; color: var(--fg-muted);">${escape(r.author ?? '')}</td>
       <td style="font-size: 13px; color: var(--fg-muted);">${escape(r.source_branch ?? '')} <span style="opacity: 0.3">→</span> ${escape(r.dest_branch ?? '')}</td>
       <td><span class="State State--${r.state}">${formatLabel(r.state)}</span></td>
       <td style="text-align: right;">${r.url ? `<a href="${r.url}" target="_blank" class="btn-link text-small">Open ↗</a>` : ''}</td>
     </tr>`).join('');
-    return `<div class="Box mb-4 shadow-sm">
+    return `<div class="Box mb-4 shadow-sm" data-repo-group="${escape(repo)}">
       <div class="Box-header">
-        <h3 class="Box-title">${escape(repo)} <span class="Counter ml-2">${list.length}</span></h3>
+        <h3 class="Box-title" style="font-weight: 500;">${escape(repo)} <span class="Counter ml-2">${list.length}</span></h3>
       </div>
       <table class="dashboard-table">
         <tbody>${items}</tbody>
@@ -286,13 +286,18 @@ function renderIndex(db: ReturnType<typeof getDb>): string {
 
   <main class="container-lg p-responsive mt-4">
     <div class="d-flex flex-justify-between flex-items-center mb-3">
-      <h1 class="h2">Pull Requests</h1>
-      <button class="btn btn-sm btn-primary" onclick="syncPRs(this)">Sync PRs</button>
+      <h1 class="h2" style="font-weight: 700;">Pull Requests</h1>
+      <div class="d-flex flex-items-center" style="gap: 8px;">
+        <input id="pr-search" type="search" placeholder="Search PRs…" autocomplete="off"
+          style="padding: 5px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; width: 220px; outline: none; background: var(--canvas); color: var(--fg);"
+          oninput="filterPRs(this.value)">
+        <button class="btn btn-sm btn-primary" onclick="syncPRs(this)">Sync PRs</button>
+      </div>
     </div>
 
-    ${rows.length === 0 
-      ? '<div class="blankslate"><h3>No pull requests found</h3><p>Run <code>lens list</code>.</p></div>' 
-      : `<div>${sections}</div>`}
+    ${rows.length === 0
+      ? '<div class="blankslate"><h3>No pull requests found</h3><p>Run <code>lens list</code>.</p></div>'
+      : `<div id="pr-list">${sections}</div>`}
   </main>
 
   <div class="modal-backdrop" id="custom-modal-backdrop">
@@ -307,6 +312,19 @@ function renderIndex(db: ReturnType<typeof getDb>): string {
   </div>
 
   <script>
+    function filterPRs(query) {
+      const q = query.trim().toLowerCase();
+      document.querySelectorAll('[data-repo-group]').forEach(group => {
+        let visibleRows = 0;
+        group.querySelectorAll('tr[data-search]').forEach(row => {
+          const match = !q || row.dataset.search.includes(q);
+          row.style.display = match ? '' : 'none';
+          if (match) visibleRows++;
+        });
+        group.style.display = visibleRows === 0 ? 'none' : '';
+      });
+    }
+
     function uiAlert(message, title = 'Notification') {
       return new Promise((resolve) => {
         const backdrop = document.getElementById('custom-modal-backdrop');
@@ -1483,7 +1501,7 @@ const BASE_CSS = `<style>
   .Box { background: var(--primary-white); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; box-shadow: var(--shadow-sm); transition: box-shadow 0.2s ease; }
   .Box:hover { box-shadow: var(--shadow-md); }
   .Box-header { padding: 16px 20px; background: rgba(250,250,250,0.5); border-bottom: 1px solid var(--border); }
-  .Box-title { font-size: 15px; font-weight: 600; }
+  .Box-title { font-size: 15px; font-weight: 500; }
   .Box-body { padding: 20px; border-bottom: 1px solid var(--border); }
   .Box-body:last-child { border-bottom: none; }
   
@@ -1494,7 +1512,7 @@ const BASE_CSS = `<style>
   .dashboard-table td { padding: 16px 20px; border-bottom: 1px solid var(--border); font-size: 14px; transition: background 0.1s; }
   .dashboard-table tr:hover td { background: rgba(0,0,0,0.01); }
   .dashboard-table tr:last-child td { border-bottom: none; }
-  .dashboard-table a { color: var(--primary-black); text-decoration: none; font-weight: 600; transition: color 0.2s; }
+  .dashboard-table a { color: var(--primary-black); text-decoration: none; font-weight: 500; transition: color 0.2s; }
   .dashboard-table a:hover { color: var(--accent-blue); }
   
   .blankslate { padding: 64px 32px; text-align: center; background: var(--primary-white); border: 1px dashed var(--border-hover); border-radius: var(--radius-lg); }

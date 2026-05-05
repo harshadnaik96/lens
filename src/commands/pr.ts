@@ -98,8 +98,12 @@ export async function analyzePR(cfg: Config, prId: string, opts: AnalyzeOpts = {
   if (opts.effort) logger.log(`effort=${opts.effort} → triage=${models.triage} review=${models.review} critic=${models.critic}`);
 
   recordTransition(prId, 'ANALYZING');
-  logger.log(`fetching diff for ${prId}...`);
-  const diff = await forge.getDiff(ref);
+  logger.log(`fetching diff and existing comments for ${prId}...`);
+  const [diff, existingComments] = await Promise.all([
+    forge.getDiff(ref),
+    forge.getComments(ref),
+  ]);
+  if (existingComments.length) logger.log(`  → ${existingComments.length} existing inline comment(s) fetched`);
   const fileDiffs = splitDiffByFile(diff);
   const allFiles = fileDiffs.map((f) => f.path);
 
@@ -109,6 +113,13 @@ export async function analyzePR(cfg: Config, prId: string, opts: AnalyzeOpts = {
   if (opts.skipTriage) {
     triageItems = fileDiffs.map((f) => ({ path: f.path, decision: 'deep', reason: 'triage skipped', source: 'heuristic' }));
     logger.log(`triage: skipped by user option`);
+  } else if (opts.reAnalyze && (triageItems = loadCachedTriage(db, prId, fileDiffs)).length > 0) {
+    logger.log(`triage: reusing cached decisions for ${triageItems.length} file(s) (skipped LLM call)`);
+    if (opts.onTriage) opts.onTriage(triageItems);
+    const counts = triageItems.reduce<Record<string, number>>((acc, t) => {
+      acc[t.decision] = (acc[t.decision] ?? 0) + 1; return acc;
+    }, {});
+    logger.log(`  → deep:${counts.deep ?? 0}  shallow:${counts.shallow ?? 0}  skip:${counts.skip ?? 0}`);
   } else {
     logger.log(`triage: classifying ${fileDiffs.length} files...`);
     const tt0 = Date.now();
@@ -153,6 +164,7 @@ export async function analyzePR(cfg: Config, prId: string, opts: AnalyzeOpts = {
     contextBlock,
     prompt: '',
     lenses,
+    existingComments,
   };
 
   logger.log(`pass 1: ${provider.name} candidate review on ${reviewableFiles.length} files...`);
@@ -177,11 +189,18 @@ export async function analyzePR(cfg: Config, prId: string, opts: AnalyzeOpts = {
   if (candidate.usage) logger.log(`  review tokens: ${candidate.usage.tokens_in} in / ${candidate.usage.tokens_out} out (${candidate.usage.source})`);
 
   let result = candidate;
-  if (!opts.skipCritic) {
-    logger.log(`\npass 2: critic refining ${candidate.comments.length} candidate comments...`);
+  if (!opts.skipCritic && candidate.comments.length > 0) {
+    // Narrow the diff to only files that have candidate comments — reduces critic input by 50-80%.
+    const commentedPaths = new Set(candidate.comments.map((c) => c.file));
+    const criticDiff = reviewableFiles
+      .filter((f) => commentedPaths.has(f.path))
+      .map((f) => annotateDiff(f.body))
+      .join('');
+    const criticInput = { ...reviewInput, diff: criticDiff };
+    logger.log(`\npass 2: critic refining ${candidate.comments.length} candidate comments across ${commentedPaths.size} file(s)...`);
     const ct0 = Date.now();
     try {
-      result = await critique(provider, reviewInput, candidate, models.critic);
+      result = await critique(provider, criticInput, candidate, models.critic);
       stageUsages.push({ stage: 'critic', model: models.critic, usage: result.usage, ms: Date.now() - ct0 });
       if (result.thinkingText) {
         logger.log(`\n--- CRITIC MODEL THINKING ---\n${result.thinkingText}\n--- END THINKING ---`);
@@ -322,6 +341,36 @@ function mergeReanalysis(
     insC.run(aid, c.file, c.line, c.side, c.severity, c.body, c.body, c.confidence, c.category ?? 'correctness');
   }
   return aid;
+}
+
+function loadCachedTriage(
+  db: ReturnType<typeof getDb>,
+  prId: string,
+  fileDiffs: { path: string }[],
+): TriageItem[] {
+  const prevAnalysis = db
+    .prepare(`SELECT id FROM analysis WHERE pr_id=? ORDER BY id DESC LIMIT 1`)
+    .get(prId) as { id: number } | undefined;
+  if (!prevAnalysis) return [];
+
+  const rows = db
+    .prepare(`SELECT file, decision, reason, source FROM triage_decision WHERE analysis_id=?`)
+    .all(prevAnalysis.id) as Array<{ file: string; decision: string; reason: string; source: string }>;
+  if (rows.length === 0) return [];
+
+  const currentPaths = new Set(fileDiffs.map((f) => f.path));
+  const cachedPaths = new Set(rows.map((r) => r.file));
+  // Only reuse if cached decisions cover every file in the current diff.
+  if (![...currentPaths].every((p) => cachedPaths.has(p))) return [];
+
+  return rows
+    .filter((r) => currentPaths.has(r.file))
+    .map((r) => ({
+      path: r.file,
+      decision: r.decision as TriageItem['decision'],
+      reason: r.reason,
+      source: r.source as TriageItem['source'],
+    }));
 }
 
 function recordTransition(prId: string, to: string, note?: string) {
