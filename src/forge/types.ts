@@ -24,6 +24,15 @@ export interface PRComment {
   body: string;
 }
 
+export interface ReviewComment {
+  file: string;
+  line: number | null;
+  author: string;
+  body: string;
+  resolved: boolean;
+  createdAt: string;
+}
+
 export interface Forge {
   name: "bitbucket" | "github";
   listOpenPRs(): Promise<PRSummary[]>;
@@ -36,6 +45,9 @@ export interface Forge {
     side: "old" | "new",
     body: string,
   ): Promise<unknown>;
+  postTopLevelComment(ref: PRRef, body: string): Promise<unknown>;
+  getMergedPRs(limit: number): Promise<PRSummary[]>;
+  getReviewComments(ref: PRRef): Promise<ReviewComment[]>;
 }
 
 /** Composite id we store in DB and accept on the CLI: `{forge}:{owner}:{repo}:{number}` */
@@ -44,13 +56,27 @@ export function refToId(ref: PRRef): string {
 }
 
 export function idToRef(id: string): PRRef {
-  const m = id.match(/^(gh|bb):([^:]+):([^:]+):(\d+)$/);
-  if (!m)
-    throw new Error(`bad PR id: ${id} (expected gh|bb:owner:repo:number)`);
-  return {
-    forge: m[1] === "gh" ? "github" : "bitbucket",
-    owner: m[2],
-    repo: m[3],
-    number: Number(m[4]),
-  };
+  return parseRef(id);
+}
+
+/**
+ * Accept either a composite ID (`gh:owner:repo:123`, `bb:ws:repo:456`)
+ * or a full web URL (GitHub PR or Bitbucket PR).
+ */
+export function parseRef(input: string): PRRef {
+  // Composite ID form
+  const idM = input.match(/^(gh|bb):([^:]+):([^:]+):(\d+)$/);
+  if (idM) {
+    return { forge: idM[1] === "gh" ? "github" : "bitbucket", owner: idM[2], repo: idM[3], number: Number(idM[4]) };
+  }
+
+  // GitHub URL: https://github.com/owner/repo/pull/123
+  const ghM = input.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+  if (ghM) return { forge: "github", owner: ghM[1], repo: ghM[2], number: Number(ghM[3]) };
+
+  // Bitbucket URL: https://bitbucket.org/workspace/repo/pull-requests/123
+  const bbM = input.match(/bitbucket\.org\/([^/]+)\/([^/]+)\/pull-requests\/(\d+)/);
+  if (bbM) return { forge: "bitbucket", owner: bbM[1], repo: bbM[2], number: Number(bbM[3]) };
+
+  throw new Error(`Cannot parse PR reference: "${input}"\nExpected: gh|bb:owner:repo:N or a GitHub/Bitbucket PR URL`);
 }

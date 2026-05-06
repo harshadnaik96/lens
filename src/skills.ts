@@ -14,6 +14,14 @@ export function pickSkillPacks(changedFiles: string[]): string[] {
   if (exts.has('.go')) packs.push('go.md');
   if (exts.has('.java')) packs.push('java.md');
   if (exts.has('.py')) packs.push('python.md');
+  if (exts.has('.dart')) packs.push('flutter.md');
+  if (exts.has('.sql') || changedFiles.some((f) => /migrations?\/|\/schema\//i.test(f))) packs.push('sql.md');
+  if (exts.has('.graphql') || exts.has('.gql')) packs.push('graphql.md');
+  if (
+    changedFiles.some((f) =>
+      /Dockerfile|\.tf$|docker-compose|\.github\/workflows\//i.test(f),
+    )
+  ) packs.push('iac.md');
   return packs;
 }
 

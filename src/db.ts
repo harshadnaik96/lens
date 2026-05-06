@@ -89,6 +89,49 @@ export function initDb(): Database.Database {
       model TEXT,
       error TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS reviewer_comment (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      forge TEXT NOT NULL,
+      workspace TEXT NOT NULL,
+      repo TEXT NOT NULL,
+      pr_number INTEGER NOT NULL,
+      pr_title TEXT,
+      author TEXT NOT NULL,
+      file TEXT NOT NULL,
+      line INTEGER,
+      body TEXT NOT NULL,
+      category TEXT,
+      resolved INTEGER DEFAULT 0,
+      fetched_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(forge, workspace, repo, pr_number, author, file, line)
+    );
+
+    CREATE TABLE IF NOT EXISTS reviewer_profile (
+      reviewer TEXT PRIMARY KEY,
+      categories TEXT,
+      acceptance_rate REAL,
+      total_accepted INTEGER DEFAULT 0,
+      total_seen INTEGER DEFAULT 0,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS symbol_index (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_root TEXT NOT NULL,
+      file TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('def','call')),
+      language TEXT NOT NULL,
+      line INTEGER NOT NULL,
+      indexed_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_symbol_index_repo_symbol
+      ON symbol_index(repo_root, symbol);
+
+    CREATE INDEX IF NOT EXISTS idx_symbol_index_repo_file
+      ON symbol_index(repo_root, file);
   `);
 
   // Defensive ALTERs for existing dbs upgraded from older schema.
@@ -102,6 +145,7 @@ export function initDb(): Database.Database {
     `ALTER TABLE analysis ADD COLUMN tokens_out_total INTEGER`,
     `ALTER TABLE comment_draft ADD COLUMN category TEXT DEFAULT 'correctness'`,
     `ALTER TABLE comment_draft ADD COLUMN reject_reason TEXT`,
+    `ALTER TABLE comment_draft ADD COLUMN reviewer TEXT`,
     `ALTER TABLE usage_log ADD COLUMN cost_usd REAL`,
     `ALTER TABLE usage_log ADD COLUMN stage TEXT`,
     `ALTER TABLE usage_log ADD COLUMN model TEXT`,

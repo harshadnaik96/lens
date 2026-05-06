@@ -41,6 +41,20 @@ const ConfigSchema = z.object({
     name: z.string(),
     botFooter: z.string().default("[Reviewed by {name} via lens]"),
   }),
+  hook: z.object({
+    effort: z.enum(['low', 'medium', 'high']).default('low'),
+    skipCritic: z.boolean().default(true),
+    timeoutSec: z.number().default(30),
+    baseBranch: z.string().optional(),
+  }).optional(),
+  learn: z.object({
+    maxPRs: z.number().default(50),
+    useAI: z.boolean().default(true),
+  }).optional(),
+  index: z.object({
+    languages: z.array(z.string()).default(['ts','js','go','py','java','dart']),
+    excludeDirs: z.array(z.string()).default(['node_modules','vendor','dist','build','.next','.git']),
+  }).optional(),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;

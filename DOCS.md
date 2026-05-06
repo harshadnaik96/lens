@@ -26,6 +26,10 @@
 8. [📊 Tokens, Cost & The Style Corpus](#8-tokens-cost--the-style-corpus)
 9. [💻 Resource Usage](#9-resource-usage)
 10. [❓ Troubleshooting](#10-troubleshooting)
+11. [🪝 Pre-push Hook](#11-pre-push-hook)
+12. [📋 Reviewer Briefing](#12-reviewer-briefing)
+13. [🧬 Institutional Memory](#13-institutional-memory)
+14. [🔭 Codebase-Aware Review](#14-codebase-aware-review)
 
 ---
 
@@ -332,9 +336,30 @@ lens serve                              # 3. curate in browser
 
 Most users keep `lens serve` running in a terminal pane next to their editor and reach for it whenever a PR review notification comes in.
 
+**Power-user workflow** (with all features enabled):
+
+```bash
+# one-time per repo: install hook + build index
+lens hook install
+lens index
+
+# one-time per team: mine PR history for team patterns
+lens learn
+
+# before opening a PR: hook runs automatically on git push
+# (reviews your diff, prompts on blockers)
+
+# when reviewing someone else's PR:
+lens brief gh:acme:api:42               # post a briefing so reviewers know where to focus
+lens analyze gh:acme:api:42 --brief     # brief + full review in one shot
+lens serve                              # curate, then submit
+```
+
 ---
 
 ## 4. Commands Reference
+
+### Core
 
 | Command                             | What it does                                                     |
 | :---------------------------------- | :--------------------------------------------------------------- |
@@ -344,6 +369,7 @@ Most users keep `lens serve` running in a terminal pane next to their editor and
 | `lens analyze <id> --effort high`   | Use the strongest models available (Opus / Pro).                 |
 | `lens analyze <id> --no-critic`     | Skip the self-critique pass (cheaper, noisier).                  |
 | `lens analyze <id> --no-triage`     | Review every file, even lockfiles (rarely useful).               |
+| `lens analyze <id> --brief`         | Post a reviewer briefing to the forge before inline comments.    |
 | `lens serve`                        | Launch the curation UI on `http://localhost:7777`.               |
 | `lens serve --port 8080`            | Use a different port.                                            |
 | `lens usage`                        | Per-provider summary (calls, tokens, cost).                      |
@@ -354,6 +380,43 @@ Most users keep `lens serve` running in a terminal pane next to their editor and
 | `lens diff --only-edited`           | Hide untouched comments — show only what you edited or rejected. |
 | `lens export-eval`                  | Dump the full eval log as JSONL.                                 |
 | `lens export-eval --out file.jsonl` | Write to a file.                                                 |
+
+### Pre-push Hook
+
+| Command                    | What it does                                            |
+| :------------------------- | :------------------------------------------------------ |
+| `lens hook install`        | Install a git pre-push hook in the current repo.        |
+| `lens hook install --force`| Overwrite an existing hook.                             |
+| `lens hook uninstall`      | Remove the lens pre-push hook.                          |
+| `lens hook run`            | (Internal) called by git — not for direct use.          |
+
+### Reviewer Briefing
+
+| Command                          | What it does                                                 |
+| :------------------------------- | :----------------------------------------------------------- |
+| `lens brief <id>`                | Generate and post a reviewer briefing for a PR.             |
+| `lens brief <id> --no-post`      | Print the briefing locally without posting to the forge.    |
+| `lens brief <id> -p gemini`      | Use a specific provider for briefing generation.            |
+| `lens brief <id> -e low`         | Use effort=low models (faster, cheaper).                    |
+
+### Institutional Memory
+
+| Command                          | What it does                                                      |
+| :------------------------------- | :---------------------------------------------------------------- |
+| `lens learn`                     | Mine merged PRs and write `.lens/skills.md` with team patterns.  |
+| `lens learn --max-prs 100`       | Mine more PRs (default: 50).                                     |
+| `lens learn --no-ai`             | Use frequency analysis instead of LLM clustering.               |
+| `lens learn --dry-run`           | Preview what would be written without writing.                   |
+| `lens accuracy`                  | Show AI comment acceptance rates by category and severity.       |
+| `lens accuracy --category security` | Filter to one lens category.                                  |
+
+### Codebase Index
+
+| Command                    | What it does                                                       |
+| :------------------------- | :----------------------------------------------------------------- |
+| `lens index`               | Build or refresh the symbol index for the current repo.           |
+| `lens index --force`       | Re-index even if the index is fresh.                              |
+| `lens index --root <path>` | Index a specific repo root instead of auto-detecting from `cwd`. |
 
 ---
 
@@ -485,3 +548,263 @@ Lens itself doesn't charge anything. Token cost is whatever your provider charge
 ---
 
 **See also**: [CAPABILITIES.md](./CAPABILITIES.md) for provider-specific notes and quirks.
+
+---
+
+## 11. Pre-push Hook
+
+The pre-push hook turns lens from a reactive tool (run after pushing) into a proactive one — it reviews your changes **before** anyone else sees them.
+
+### Install
+
+```bash
+cd your-repo
+lens hook install
+```
+
+This writes a `.git/hooks/pre-push` script. From this point on, every `git push` triggers a quick AI review of the diff between `HEAD` and `origin/<base-branch>`.
+
+### What happens on push
+
+```
+🔍 lens: reviewing your changes before push...
+
+lens found: 1 blocker(s), 2 concern(s)
+
+🚫 Blockers:
+  src/auth/session.ts:87 — Token stored in localStorage exposes it to XSS...
+
+Proceed with push anyway? [y/N]
+```
+
+- **No issues** → push proceeds silently.
+- **Only concerns** → push proceeds with a warning printed.
+- **Blockers found** → lens prints each blocker with file and line, then prompts `[y/N]`. Type `y` to push anyway, `N` (or Enter) to cancel and fix first.
+- **Tool timeout or failure** → push proceeds. The hook never blocks you due to its own errors.
+
+### Configuration
+
+Add a `hook` section to `~/.lens/config.json` to tune the behaviour:
+
+```jsonc
+{
+  "hook": {
+    "effort": "low",        // "low"|"medium"|"high" — default: "low" (fast)
+    "skipCritic": true,     // skip the second-pass critic (default: true, keeps it fast)
+    "timeoutSec": 30,       // abort and allow push after N seconds (default: 30)
+    "baseBranch": "main"    // override auto-detected base branch
+  }
+}
+```
+
+The hook uses `effort: low` by default — Haiku-class models, no critic — so it typically finishes in 10–20 seconds. Use `effort: medium` if you want Sonnet-quality review on every push (slower but higher signal).
+
+### Uninstall
+
+```bash
+lens hook uninstall
+```
+
+---
+
+## 12. Reviewer Briefing
+
+`lens brief` generates a structured orientation for human reviewers — not inline code comments, but a high-level guide posted as a top-level PR comment.
+
+### Usage
+
+```bash
+# post a briefing to the forge (GitHub/Bitbucket)
+lens brief gh:acme:api:42
+
+# print locally without posting
+lens brief gh:acme:api:42 --no-post
+
+# post briefing AND run full review in one command
+lens analyze gh:acme:api:42 --brief
+```
+
+### What gets posted
+
+```markdown
+## 🔍 Reviewer Briefing — Add payment retry logic
+
+**Risk:** 🔴 HIGH | **Estimated review time:** ~18 min
+
+### What changed
+- RetryService wraps PaymentGateway with exponential backoff (3 attempts)
+- Failed payments flow to a dead-letter queue after exhausting retries
+- New config keys: RETRY_MAX_ATTEMPTS, RETRY_BACKOFF_MS
+
+### Focus here
+- **src/retry.ts** — Lock acquisition order may deadlock under concurrent retries
+- **src/queue/dead_letter.ts** — No TTL on queued items; unbounded growth risk
+
+### Safe to skim
+- migrations/ — additive column only, backward compatible
+- tests/ — standard mocks, no new test patterns introduced
+```
+
+### How risk is determined
+
+| Level  | Criteria                                                                          |
+| :----- | :-------------------------------------------------------------------------------- |
+| HIGH   | Security-sensitive paths, auth, DB migrations, public API changes, core logic     |
+| MEDIUM | Moderate logic changes, internal API changes, non-trivial refactors               |
+| LOW    | Config tweaks, docs, minor additions, test-only changes, dependency bumps         |
+
+Estimated review time is calculated from total changed lines ÷ 50, capped at 90 minutes.
+
+---
+
+## 13. Institutional Memory
+
+Over time, lens can learn what *your team* considers worth flagging — not generic AI advice, but patterns extracted from your own merged PR history.
+
+### `lens learn` — mine PR history
+
+```bash
+# mine last 50 merged PRs (default) and write .lens/skills.md
+lens learn
+
+# mine more history
+lens learn --max-prs 100
+
+# preview without writing
+lens learn --dry-run
+
+# skip LLM clustering, use frequency analysis only (no provider needed)
+lens learn --no-ai
+```
+
+**What it does:**
+
+1. Fetches merged PRs from your forge (GitHub or Bitbucket).
+2. Collects all review comments left on those PRs.
+3. Groups comments by file extension and clusters recurring patterns — either via LLM (default) or frequency analysis.
+4. Writes `.lens/skills.md` in your current directory with the extracted team rules.
+
+**Output example:**
+
+```markdown
+<!-- lens:generated:start -->
+# Team Review Patterns
+<!-- auto-generated by lens learn on 2026-05-06 -->
+
+## [correctness]
+### ts files
+- Check for: missing await
+- Check for: null check before accessing nested properties
+- Check for: error boundary missing
+
+### go files
+- Check for: mutex unlock defer
+- Check for: context cancellation
+<!-- lens:generated:end -->
+```
+
+The generated block is wrapped in sentinel comments. Any content you add outside those comments is preserved on subsequent `lens learn` runs.
+
+### Commit `.lens/skills.md` to your repo
+
+Once generated, check it in. Every teammate who uses lens on that repo automatically gets the team's accumulated knowledge injected into every review — without any extra setup.
+
+```bash
+git add .lens/skills.md
+git commit -m "chore: add lens team skill pack"
+```
+
+### `lens accuracy` — measure AI signal quality
+
+```bash
+lens accuracy
+```
+
+Shows acceptance rates for every lens category based on your curation history (comments you kept vs. edited vs. rejected):
+
+```
+Category            Severity      Total     Accepted    Rate
+──────────────────────────────────────────────────────────
+correctness         blocker          12           11    91%  ██████████ 91%
+correctness         concern          34           27    79%  ████████░░ 79%
+──────────────────────────────────────────────────────────
+security            blocker           4            4   100%  ██████████ 100%
+security            concern          18           12    66%  ██████░░░░ 66%
+──────────────────────────────────────────────────────────
+maintainability     suggestion       41           11    26%  ██░░░░░░░░ 26%
+```
+
+Use this to decide which lenses to trust and which to tune. A maintainability acceptance rate under 30% is a signal to tighten the maintainability skill pack or raise its threshold.
+
+Filter to a specific lens:
+
+```bash
+lens accuracy --category security
+lens accuracy --severity blocker
+```
+
+---
+
+## 14. Codebase-Aware Review
+
+Standard diff-based review only sees what changed. Lens can also index your entire codebase to understand *what depends on what* — so when you change a widely-used function, the review flags it.
+
+### Build the index
+
+```bash
+# run once per repo (takes < 10s for most codebases)
+lens index
+```
+
+The index scans your repo for exported symbol definitions and call sites, storing everything in `~/.lens/lens.db`. It covers TypeScript, JavaScript, Go, Python, Java, and Dart.
+
+```
+Indexing /Users/you/code/my-api...
+✓ Indexed 1,243 files → 8,421 symbols, 34,872 call sites (4,102ms)
+
+Top referenced symbols:
+  parseUserToken                 89 call sites
+  DatabaseClient                 67 call sites
+  validateRequest                51 call sites
+```
+
+### What you get in reviews
+
+Once indexed, every `lens analyze` run automatically queries the index for the symbols changed in the PR and injects a blast radius block into the prompt:
+
+```
+## Blast Radius (symbol call-site analysis)
+
+Changed exported symbols and their call-site counts:
+- `parseUserToken`: 89 call sites 🔴 HIGH IMPACT
+- `SessionStore`: 12 call sites 🟡
+
+Files outside this PR that depend on changed symbols (6):
+- src/middleware/auth.ts
+- src/routes/admin.ts
+- src/workers/token_refresh.ts
+- …and 3 more
+```
+
+This gives the reviewer context that is impossible to get from the diff alone — especially for shared utilities and core services.
+
+### Keep the index fresh
+
+The index is valid for 5 minutes by default. Re-run before reviewing large PRs touching shared code:
+
+```bash
+lens index --force
+```
+
+You can also add `lens index` to your git post-merge or post-checkout hook to keep it updated automatically.
+
+### Configuration
+
+```jsonc
+{
+  "index": {
+    "languages": ["ts", "js", "go", "py", "java", "dart"],
+    "excludeDirs": ["node_modules", "vendor", "dist", "build", ".next", ".git"]
+  }
+}
+```

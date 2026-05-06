@@ -1,6 +1,6 @@
 import type { Config } from '../config.js';
 import { getForge } from '../forge/index.js';
-import { idToRef, refToId } from '../forge/types.js';
+import { parseRef, refToId } from '../forge/types.js';
 import { getDb, initDb } from '../db.js';
 import { getProvider } from '../providers/index.js';
 import { loadSkills } from '../skills.js';
@@ -10,7 +10,10 @@ import { triage, type TriageItem } from '../triage.js';
 import { extractContext, buildContextBlock } from '../context.js';
 import { detectRelevantLenses, formatLenses } from '../lens_detect.js';
 import { estimateCost, fmtUsd } from '../pricing.js';
-import type { UsageInfo } from '../providers/types.js';
+import type { UsageInfo, ReviewComment } from '../providers/types.js';
+import { queryBlastRadius, formatBlastRadius } from '../indexer.js';
+import { detectRepoRoot } from '../local_diff.js';
+import { detectCrossPatterns, formatPatternReport } from '../pattern_detect.js';
 
 class Logger {
   lines: string[] = [];
@@ -22,6 +25,155 @@ class Logger {
     if (this.onLog) this.onLog(line);
   }
   getLogs() { return this.lines.join('\n'); }
+}
+
+export interface PipelineOpts {
+  providerOverride?: string;
+  skipCritic?: boolean;
+  skipTriage?: boolean;
+  effort?: Effort;
+  onLog?: (msg: string) => void;
+  onTriage?: (items: TriageItem[]) => void;
+  repoRoot?: string;
+}
+
+export interface PipelineResult {
+  comments: ReviewComment[];
+  summary: string;
+  triageItems: TriageItem[];
+  usage: Array<{ stage: string; model?: string; usage?: UsageInfo; ms: number }>;
+}
+
+export async function runAnalysisPipeline(
+  cfg: Config,
+  diff: string,
+  changedFiles: string[],
+  prTitle: string,
+  prDescription: string,
+  opts: PipelineOpts,
+): Promise<PipelineResult> {
+  const logger = new Logger(opts.onLog);
+  const provider = getProvider(cfg, opts.providerOverride);
+
+  const ok = await provider.isAvailable();
+  if (!ok) throw new Error(`provider ${provider.name} not available on PATH`);
+
+  const models = resolveModels(cfg, opts.effort);
+  if (opts.effort) logger.log(`effort=${opts.effort} → triage=${models.triage} review=${models.review} critic=${models.critic}`);
+
+  const fileDiffs = splitDiffByFile(diff);
+  const allFiles = fileDiffs.map((f) => f.path);
+
+  const stageUsages: Array<{ stage: string; model?: string; usage?: UsageInfo; ms: number }> = [];
+
+  let triageItems: TriageItem[];
+  if (opts.skipTriage) {
+    triageItems = fileDiffs.map((f) => ({ path: f.path, decision: 'deep' as const, reason: 'triage skipped', source: 'heuristic' as const }));
+    logger.log(`triage: skipped by user option`);
+  } else {
+    logger.log(`triage: classifying ${fileDiffs.length} files...`);
+    const tt0 = Date.now();
+    const tres = await triage(provider, fileDiffs, models.triage);
+    triageItems = tres.items;
+    stageUsages.push({ stage: 'triage', model: models.triage, usage: tres.usage, ms: Date.now() - tt0 });
+    if (opts.onTriage) opts.onTriage(triageItems);
+    const counts = triageItems.reduce<Record<string, number>>((acc, t) => {
+      acc[t.decision] = (acc[t.decision] ?? 0) + 1; return acc;
+    }, {});
+    logger.log(`  → deep:${counts.deep ?? 0}  shallow:${counts.shallow ?? 0}  skip:${counts.skip ?? 0}`);
+    if (tres.usage) logger.log(`  triage tokens: ${tres.usage.tokens_in} in / ${tres.usage.tokens_out} out (${tres.usage.source})`);
+  }
+
+  const keepPaths = new Set(triageItems.filter((t) => t.decision !== 'skip').map((t) => t.path));
+  const reviewableFiles = fileDiffs.filter((f) => keepPaths.has(f.path));
+  const reviewableDiff = reviewableFiles.map((f) => annotateDiff(f.body)).join('');
+
+  if (reviewableFiles.length === 0) {
+    logger.log('All files triaged as skip. Nothing to review.');
+    return {
+      comments: [],
+      summary: 'No reviewable files (all triaged as skip).',
+      triageItems,
+      usage: stageUsages,
+    };
+  }
+
+  const deepPaths = new Set(triageItems.filter((t) => t.decision === 'deep').map((t) => t.path));
+  const contexts = reviewableFiles.filter((f) => deepPaths.has(f.path)).map(extractContext);
+  let contextBlock = buildContextBlock(contexts);
+  if (contextBlock) logger.log(`context: extracted symbols/imports for ${contexts.filter((c) => c.imports.length || c.symbols.length).length} deep files`);
+
+  // Opportunistic blast radius — only if index exists for this repo
+  try {
+    const repoRoot = await detectRepoRoot(opts.repoRoot ? undefined : process.cwd());
+    const exportedSymbols = contexts.flatMap((c) => c.symbols);
+    if (exportedSymbols.length > 0) {
+      const br = queryBlastRadius(repoRoot, exportedSymbols);
+      const brBlock = formatBlastRadius(br, changedFiles);
+      if (brBlock) {
+        contextBlock = contextBlock ? contextBlock + '\n\n' + brBlock : brBlock;
+        logger.log(`blast radius: ${br.callSiteCounts.size} impacted symbol(s), ${br.dependentFiles.length} dependent file(s)`);
+      }
+    }
+  } catch { /* no index or not in a git repo — skip silently */ }
+
+  const lenses = detectRelevantLenses(reviewableDiff, contexts, allFiles);
+  logger.log(`lenses: ${formatLenses(lenses)}`);
+
+  const skills = loadSkills(allFiles, undefined, lenses);
+  const reviewInput = {
+    prTitle,
+    prDescription,
+    diff: reviewableDiff,
+    changedFiles: reviewableFiles.map((f) => ({ path: f.path })),
+    skills,
+    contextBlock,
+    prompt: '',
+    lenses,
+  };
+
+  logger.log(`pass 1: ${provider.name} candidate review on ${reviewableFiles.length} files...`);
+  const reviewT0 = Date.now();
+  const candidate = await provider.review(reviewInput, { model: models.review });
+  stageUsages.push({ stage: 'review', model: models.review, usage: candidate.usage, ms: Date.now() - reviewT0 });
+
+  if (candidate.thinkingText) {
+    logger.log(`\n--- REVIEW MODEL THINKING ---\n${candidate.thinkingText}\n--- END THINKING ---`);
+  }
+  logger.log(`pass 1 complete: ${candidate.comments.length} candidate comments`);
+  if (candidate.usage) logger.log(`  review tokens: ${candidate.usage.tokens_in} in / ${candidate.usage.tokens_out} out (${candidate.usage.source})`);
+
+  let result = candidate;
+  if (!opts.skipCritic && candidate.comments.length > 0) {
+    const commentedPaths = new Set(candidate.comments.map((c) => c.file));
+    const criticDiff = reviewableFiles
+      .filter((f) => commentedPaths.has(f.path))
+      .map((f) => annotateDiff(f.body))
+      .join('');
+    const criticInput = { ...reviewInput, diff: criticDiff };
+    logger.log(`\npass 2: critic refining ${candidate.comments.length} candidate comments across ${commentedPaths.size} file(s)...`);
+    const ct0 = Date.now();
+    try {
+      result = await critique(provider, criticInput, candidate, models.critic);
+      stageUsages.push({ stage: 'critic', model: models.critic, usage: result.usage, ms: Date.now() - ct0 });
+      if (result.thinkingText) {
+        logger.log(`\n--- CRITIC MODEL THINKING ---\n${result.thinkingText}\n--- END THINKING ---`);
+      }
+      if (result.usage) logger.log(`  critic tokens: ${result.usage.tokens_in} in / ${result.usage.tokens_out} out (${result.usage.source})`);
+    } catch (err: any) {
+      logger.log(`critic pass failed (${err.message}); using candidate as-is`);
+    }
+  }
+
+  logger.log(`Summary: ${result.summary.slice(0, 100)}...`);
+  logger.log(`${result.comments.length} draft comments ready.`);
+
+  return {
+    comments: result.comments as ReviewComment[],
+    summary: result.summary,
+    triageItems,
+    usage: stageUsages,
+  };
 }
 
 export async function listPRs(cfg: Config) {
@@ -87,15 +239,10 @@ function resolveModels(cfg: Config, effort?: Effort): StageModels {
 export async function analyzePR(cfg: Config, prId: string, opts: AnalyzeOpts = {}) {
   const logger = new Logger(opts.onLog);
   const forge = getForge(cfg);
-  const ref = idToRef(prId);
+  const ref = parseRef(prId);
   const provider = getProvider(cfg, opts.providerOverride);
   const db = getDb();
-
-  const ok = await provider.isAvailable();
-  if (!ok) throw new Error(`provider ${provider.name} not available on PATH`);
-
   const models = resolveModels(cfg, opts.effort);
-  if (opts.effort) logger.log(`effort=${opts.effort} → triage=${models.triage} review=${models.review} critic=${models.critic}`);
 
   recordTransition(prId, 'ANALYZING');
   logger.log(`fetching diff and existing comments for ${prId}...`);
@@ -104,113 +251,59 @@ export async function analyzePR(cfg: Config, prId: string, opts: AnalyzeOpts = {
     forge.getComments(ref),
   ]);
   if (existingComments.length) logger.log(`  → ${existingComments.length} existing inline comment(s) fetched`);
+
+  // Handle reAnalyze cached triage before delegating to pipeline
   const fileDiffs = splitDiffByFile(diff);
-  const allFiles = fileDiffs.map((f) => f.path);
-
-  const stageUsages: Array<{ stage: string; model?: string; usage?: UsageInfo; ms: number }> = [];
-
-  let triageItems: TriageItem[];
-  if (opts.skipTriage) {
-    triageItems = fileDiffs.map((f) => ({ path: f.path, decision: 'deep', reason: 'triage skipped', source: 'heuristic' }));
-    logger.log(`triage: skipped by user option`);
-  } else if (opts.reAnalyze && (triageItems = loadCachedTriage(db, prId, fileDiffs)).length > 0) {
-    logger.log(`triage: reusing cached decisions for ${triageItems.length} file(s) (skipped LLM call)`);
-    if (opts.onTriage) opts.onTriage(triageItems);
-    const counts = triageItems.reduce<Record<string, number>>((acc, t) => {
-      acc[t.decision] = (acc[t.decision] ?? 0) + 1; return acc;
-    }, {});
-    logger.log(`  → deep:${counts.deep ?? 0}  shallow:${counts.shallow ?? 0}  skip:${counts.skip ?? 0}`);
-  } else {
-    logger.log(`triage: classifying ${fileDiffs.length} files...`);
-    const tt0 = Date.now();
-    const tres = await triage(provider, fileDiffs, models.triage);
-    triageItems = tres.items;
-    stageUsages.push({ stage: 'triage', model: models.triage, usage: tres.usage, ms: Date.now() - tt0 });
-    if (opts.onTriage) opts.onTriage(triageItems);
-    const counts = triageItems.reduce<Record<string, number>>((acc, t) => {
-      acc[t.decision] = (acc[t.decision] ?? 0) + 1; return acc;
-    }, {});
-    logger.log(`  → deep:${counts.deep ?? 0}  shallow:${counts.shallow ?? 0}  skip:${counts.skip ?? 0}`);
-    if (tres.usage) logger.log(`  triage tokens: ${tres.usage.tokens_in} in / ${tres.usage.tokens_out} out (${tres.usage.source})`);
+  let cachedTriageItems: TriageItem[] | null = null;
+  if (opts.reAnalyze && !opts.skipTriage) {
+    const cached = loadCachedTriage(db, prId, fileDiffs);
+    if (cached.length > 0) {
+      cachedTriageItems = cached;
+      logger.log(`triage: reusing cached decisions for ${cached.length} file(s) (skipped LLM call)`);
+      if (opts.onTriage) opts.onTriage(cached);
+      const counts = cached.reduce<Record<string, number>>((acc, t) => {
+        acc[t.decision] = (acc[t.decision] ?? 0) + 1; return acc;
+      }, {});
+      logger.log(`  → deep:${counts.deep ?? 0}  shallow:${counts.shallow ?? 0}  skip:${counts.skip ?? 0}`);
+    }
   }
 
-  const keepPaths = new Set(triageItems.filter((t) => t.decision !== 'skip').map((t) => t.path));
-  const reviewableFiles = fileDiffs.filter((f) => keepPaths.has(f.path));
-  const reviewableDiff = reviewableFiles.map((f) => annotateDiff(f.body)).join('');
+  const t0 = Date.now();
 
-  if (reviewableFiles.length === 0) {
+  // If we have cached triage, we need to handle the "all skip" early-out ourselves
+  if (cachedTriageItems !== null && cachedTriageItems.every((t) => t.decision === 'skip')) {
     logger.log('All files triaged as skip. Nothing to review.');
     const aid = persistFreshAnalysis(db, prId, provider.name, { summary: 'No reviewable files (all triaged as skip).', comments: [], rawResponse: '' }, 0, logger.getLogs());
-    persistTriage(db, aid, fileDiffs, triageItems);
+    persistTriage(db, aid, fileDiffs, cachedTriageItems);
     recordTransition(prId, 'DRAFT_READY');
     return;
   }
 
-  const deepPaths = new Set(triageItems.filter((t) => t.decision === 'deep').map((t) => t.path));
-  const contexts = reviewableFiles.filter((f) => deepPaths.has(f.path)).map(extractContext);
-  const contextBlock = buildContextBlock(contexts);
-  if (contextBlock) logger.log(`context: extracted symbols/imports for ${contexts.filter((c) => c.imports.length || c.symbols.length).length} deep files`);
+  // Build the prDescription from triage context (for cache-reuse path we build it now;
+  // for the pipeline path, we pass empty and let it triage fresh)
+  const prDescription = cachedTriageItems ? triageContextForPrompt(cachedTriageItems) : '';
 
-  const lenses = detectRelevantLenses(reviewableDiff, contexts, allFiles);
-  logger.log(`lenses: ${formatLenses(lenses)}`);
-
-  const skills = loadSkills(allFiles, undefined, lenses);
-  const reviewInput = {
-    prTitle: '(see Bitbucket)',
-    prDescription: triageContextForPrompt(triageItems),
-    diff: reviewableDiff,
-    changedFiles: reviewableFiles.map((f) => ({ path: f.path })),
-    skills,
-    contextBlock,
-    prompt: '',
-    lenses,
-    existingComments,
-  };
-
-  logger.log(`pass 1: ${provider.name} candidate review on ${reviewableFiles.length} files...`);
-  const t0 = Date.now();
-  let candidate;
-  const reviewT0 = Date.now();
+  let reviewResult: PipelineResult;
   try {
-    candidate = await provider.review(reviewInput, { model: models.review });
+    reviewResult = await runAnalysisPipeline(cfg, diff, fileDiffs.map(f => f.path), '(see forge)', prDescription, {
+      providerOverride: opts.providerOverride,
+      skipCritic: opts.skipCritic,
+      skipTriage: opts.skipTriage || cachedTriageItems !== null,
+      effort: opts.effort,
+      onLog: opts.onLog,
+      onTriage: cachedTriageItems ? undefined : opts.onTriage,
+    });
   } catch (err: any) {
     db.prepare(
       `INSERT INTO usage_log (provider, pr_id, ok, ms_elapsed, stage, model, error) VALUES (?,?,0,?,?,?,?)`,
-    ).run(provider.name, prId, Date.now() - reviewT0, 'review', models.review ?? null, String(err.message ?? err));
+    ).run(provider.name, prId, Date.now() - t0, 'review', models.review ?? null, String(err.message ?? err));
     recordTransition(prId, 'NEW', `analyze failed: ${err.message}`);
     throw err;
   }
-  stageUsages.push({ stage: 'review', model: models.review, usage: candidate.usage, ms: Date.now() - reviewT0 });
 
-  if (candidate.thinkingText) {
-    logger.log(`\n--- REVIEW MODEL THINKING ---\n${candidate.thinkingText}\n--- END THINKING ---`);
-  }
-  logger.log(`pass 1 complete: ${candidate.comments.length} candidate comments`);
-  if (candidate.usage) logger.log(`  review tokens: ${candidate.usage.tokens_in} in / ${candidate.usage.tokens_out} out (${candidate.usage.source})`);
-
-  let result = candidate;
-  if (!opts.skipCritic && candidate.comments.length > 0) {
-    // Narrow the diff to only files that have candidate comments — reduces critic input by 50-80%.
-    const commentedPaths = new Set(candidate.comments.map((c) => c.file));
-    const criticDiff = reviewableFiles
-      .filter((f) => commentedPaths.has(f.path))
-      .map((f) => annotateDiff(f.body))
-      .join('');
-    const criticInput = { ...reviewInput, diff: criticDiff };
-    logger.log(`\npass 2: critic refining ${candidate.comments.length} candidate comments across ${commentedPaths.size} file(s)...`);
-    const ct0 = Date.now();
-    try {
-      result = await critique(provider, criticInput, candidate, models.critic);
-      stageUsages.push({ stage: 'critic', model: models.critic, usage: result.usage, ms: Date.now() - ct0 });
-      if (result.thinkingText) {
-        logger.log(`\n--- CRITIC MODEL THINKING ---\n${result.thinkingText}\n--- END THINKING ---`);
-      }
-      if (result.usage) logger.log(`  critic tokens: ${result.usage.tokens_in} in / ${result.usage.tokens_out} out (${result.usage.source})`);
-    } catch (err: any) {
-      logger.log(`critic pass failed (${err.message}); using candidate as-is`);
-    }
-  }
   const ms = Date.now() - t0;
+  const stageUsages = reviewResult.usage;
+  const triageItems = cachedTriageItems ?? reviewResult.triageItems;
 
   // Roll up token + cost totals across stages
   let totalIn = 0, totalOut = 0, totalCost = 0;
@@ -221,11 +314,18 @@ export async function analyzePR(cfg: Config, prId: string, opts: AnalyzeOpts = {
     totalCost += estimateCost(provider.name, s.model, s.usage.tokens_in, s.usage.tokens_out);
   }
 
+  // Reconstruct a result-like object for persistence helpers
+  const resultForPersist = {
+    summary: reviewResult.summary,
+    comments: reviewResult.comments,
+    rawResponse: '',
+  };
+
   let aid: number;
   if (opts.reAnalyze) {
-    aid = mergeReanalysis(db, prId, result, logger.getLogs());
+    aid = mergeReanalysis(db, prId, resultForPersist, logger.getLogs());
   } else {
-    aid = persistFreshAnalysis(db, prId, provider.name, result, ms, logger.getLogs());
+    aid = persistFreshAnalysis(db, prId, provider.name, resultForPersist, ms, logger.getLogs());
   }
   persistTriage(db, aid, fileDiffs, triageItems);
 
@@ -247,11 +347,20 @@ export async function analyzePR(cfg: Config, prId: string, opts: AnalyzeOpts = {
 
   recordTransition(prId, 'DRAFT_READY');
 
-  logger.log(`Summary: ${result.summary.slice(0, 100)}...`);
-  logger.log(`${result.comments.length} draft comments saved.`);
+  logger.log(`Summary: ${reviewResult.summary.slice(0, 100)}...`);
+  logger.log(`${reviewResult.comments.length} draft comments saved.`);
   if (totalIn || totalOut) {
     logger.log(`tokens: ${totalIn} in / ${totalOut} out  cost: ~${fmtUsd(totalCost)}`);
   }
+
+  // Surface recurring cross-PR patterns opportunistically
+  try {
+    const patternReport = detectCrossPatterns(10);
+    const patternBlock = formatPatternReport(patternReport);
+    if (patternBlock) {
+      logger.log(`\n${patternBlock}`);
+    }
+  } catch { /* non-critical */ }
 }
 
 function persistFreshAnalysis(

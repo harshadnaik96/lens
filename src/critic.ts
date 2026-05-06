@@ -1,5 +1,6 @@
 import type { Provider, ReviewInput, ReviewOutput } from './providers/types.js';
 import { ReviewOutputSchema } from './providers/types.js';
+import { buildAccuracyGuidance } from './accuracy_tuning.js';
 
 const CRITIC_RULES = `You are an elite review filter. You receive candidate comments from a multi-lens code review, each tagged with a category (correctness, security, data_integrity, api_contracts, maintainability).
 
@@ -51,7 +52,9 @@ export async function critique(
   candidate: ReviewOutput,
   model?: string,
 ): Promise<ReviewOutput> {
-  const critiquePrompt = `${CRITIC_RULES}
+  const { guidance } = buildAccuracyGuidance();
+  const tuningBlock = guidance ? `\n\n${guidance}` : '';
+  const critiquePrompt = `${CRITIC_RULES}${tuningBlock}
 
 ## Original PR diff (for reference)
 \`\`\`diff

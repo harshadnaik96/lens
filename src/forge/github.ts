@@ -1,7 +1,7 @@
 import { request } from 'undici';
 import { execa } from 'execa';
 import type { Config } from '../config.js';
-import type { Forge, PRComment, PRRef, PRSummary } from './types.js';
+import type { Forge, PRComment, PRRef, PRSummary, ReviewComment } from './types.js';
 
 export class GitHubForge implements Forge {
   name = 'github' as const;
@@ -125,6 +125,42 @@ export class GitHubForge implements Forge {
     });
     if (res.statusCode >= 400) throw new Error(`GitHub comment ${res.statusCode}: ${await res.body.text()}`);
     return await res.body.json();
+  }
+
+  async postTopLevelComment(ref: PRRef, body: string): Promise<unknown> {
+    const res = await request(this.repoUrl(ref, `/issues/${ref.number}/comments`), {
+      method: 'POST',
+      headers: await this.headers({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ body }),
+    });
+    if (res.statusCode >= 400) throw new Error(`GitHub postTopLevelComment ${res.statusCode}: ${await res.body.text()}`);
+    return res.body.json();
+  }
+
+  async getMergedPRs(limit: number): Promise<PRSummary[]> {
+    const url = `${this.base}/search/issues?q=${encodeURIComponent('is:pr is:merged author:@me')}&per_page=${Math.min(limit, 100)}&sort=updated&order=desc`;
+    const res = await request(url, { headers: await this.headers() });
+    if (res.statusCode >= 400) throw new Error(`GitHub getMergedPRs ${res.statusCode}: ${await res.body.text()}`);
+    const data = (await res.body.json()) as any;
+    return (data.items ?? []).map((p: any) => {
+      const m = (p.repository_url as string).match(/\/repos\/([^/]+)\/([^/]+)$/);
+      const owner = m?.[1] ?? '?'; const repo = m?.[2] ?? '?';
+      return { ref: { forge: 'github' as const, owner, repo, number: p.number }, title: p.title, author: p.user?.login ?? 'unknown', state: 'merged', sourceBranch: '', destBranch: '', updatedOn: p.updated_at, url: p.html_url };
+    });
+  }
+
+  async getReviewComments(ref: PRRef): Promise<ReviewComment[]> {
+    const res = await request(this.repoUrl(ref, `/pulls/${ref.number}/comments?per_page=100`), { headers: await this.headers() });
+    if (res.statusCode >= 400) throw new Error(`GitHub getReviewComments ${res.statusCode}: ${await res.body.text()}`);
+    const data = (await res.body.json()) as any[];
+    return data.map((c: any) => ({
+      file: c.path ?? '',
+      line: c.line ?? c.original_line ?? null,
+      author: c.user?.login ?? 'unknown',
+      body: c.body ?? '',
+      resolved: !!c.resolved,
+      createdAt: c.created_at ?? '',
+    }));
   }
 }
 

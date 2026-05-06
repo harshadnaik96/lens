@@ -30,6 +30,8 @@ export interface UsageInfo {
   source: "reported" | "estimated";
 }
 
+export type ReviewComment = z.infer<typeof CommentSchema>;
+
 export type ReviewOutput = z.infer<typeof ReviewOutputSchema> & {
   rawResponse: string;
   thinkingText?: string; // populated by Claude thinking models

@@ -1,6 +1,6 @@
 import { request } from "undici";
 import type { Config } from "../config.js";
-import type { Forge, PRComment, PRRef, PRSummary } from "./types.js";
+import type { Forge, PRComment, PRRef, PRSummary, ReviewComment } from "./types.js";
 
 export class BitbucketForge implements Forge {
   name = "bitbucket" as const;
@@ -190,5 +190,50 @@ export class BitbucketForge implements Forge {
         `Bitbucket comment ${res.statusCode}: ${await res.body.text()}`,
       );
     return await res.body.json();
+  }
+
+  async postTopLevelComment(ref: PRRef, body: string): Promise<unknown> {
+    const res = await request(this.repoUrl(ref, `/pullrequests/${ref.number}/comments`), {
+      method: 'POST',
+      headers: this.headers({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ content: { raw: body } }),
+    });
+    if (res.statusCode >= 400) throw new Error(`Bitbucket postTopLevelComment ${res.statusCode}: ${await res.body.text()}`);
+    return res.body.json();
+  }
+
+  async getMergedPRs(limit: number): Promise<PRSummary[]> {
+    const allPRs: PRSummary[] = [];
+    const reposRes = await request(`${this.base}/repositories/${this.workspace}?pagelen=50`, { headers: this.headers() });
+    if (reposRes.statusCode >= 400) return [];
+    const reposData = (await reposRes.body.json()) as any;
+    const repos = (reposData.values ?? []).slice(0, 10); // cap at 10 repos
+    for (const repo of repos) {
+      const slug = repo.slug;
+      const prRes = await request(`${this.base}/repositories/${this.workspace}/${slug}/pullrequests?state=MERGED&pagelen=${Math.ceil(limit / repos.length)}`, { headers: this.headers() });
+      if (prRes.statusCode >= 400) continue;
+      const prData = (await prRes.body.json()) as any;
+      for (const p of (prData.values ?? [])) {
+        allPRs.push({ ref: { forge: 'bitbucket' as const, owner: this.workspace, repo: slug, number: p.id }, title: p.title, author: p.author?.display_name ?? 'unknown', state: 'merged', sourceBranch: p.source?.branch?.name ?? '', destBranch: p.destination?.branch?.name ?? '', updatedOn: p.updated_on, url: p.links?.html?.href });
+      }
+      if (allPRs.length >= limit) break;
+    }
+    return allPRs.slice(0, limit);
+  }
+
+  async getReviewComments(ref: PRRef): Promise<ReviewComment[]> {
+    const res = await request(this.repoUrl(ref, `/pullrequests/${ref.number}/comments?pagelen=100`), { headers: this.headers() });
+    if (res.statusCode >= 400) return [];
+    const data = (await res.body.json()) as any;
+    return (data.values ?? [])
+      .filter((c: any) => !c.deleted && c.inline)
+      .map((c: any) => ({
+        file: c.inline?.path ?? '',
+        line: c.inline?.to ?? null,
+        author: c.author?.display_name ?? 'unknown',
+        body: c.content?.raw ?? '',
+        resolved: false,
+        createdAt: c.created_on ?? '',
+      }));
   }
 }
