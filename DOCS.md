@@ -30,6 +30,9 @@
 12. [📋 Reviewer Briefing](#12-reviewer-briefing)
 13. [🧬 Institutional Memory](#13-institutional-memory)
 14. [🔭 Codebase-Aware Review](#14-codebase-aware-review)
+15. [🔍 Local Scan (no forge)](#15-local-scan-no-forge)
+16. [📅 Weekly Digest](#16-weekly-digest)
+17. [🔁 Cross-PR Pattern Detection](#17-cross-pr-pattern-detection)
 
 ---
 
@@ -309,8 +312,9 @@ lens --version
 lens list
 
 # 3. Provider — analyze any PR you have open
-lens analyze gh:owner:repo:42        # GitHub
-lens analyze bb:workspace:repo:42    # Bitbucket
+lens analyze gh:owner:repo:42                              # composite ID
+lens analyze https://github.com/owner/repo/pull/42        # or paste the URL directly
+lens analyze bb:workspace:repo:42                          # Bitbucket composite ID
 ```
 
 If `lens list` returns 0 PRs but you know there are some open, double-check your `scope` and that the token/CLI actually has access to those repos. If `lens analyze` errors with `provider X not found`, your provider CLI isn't on `PATH` — start a new shell or check `which claude` / `which gemini`.
@@ -361,6 +365,15 @@ lens serve                              # curate, then submit
 
 ### Core
 
+`<id>` accepts a composite ID **or** a full PR URL:
+
+```
+gh:owner:repo:42
+https://github.com/owner/repo/pull/42
+bb:workspace:repo:42
+https://bitbucket.org/workspace/repo/pull-requests/42
+```
+
 | Command                             | What it does                                                     |
 | :---------------------------------- | :--------------------------------------------------------------- |
 | `lens list`                         | Sync open PRs into the local DB.                                 |
@@ -370,8 +383,14 @@ lens serve                              # curate, then submit
 | `lens analyze <id> --no-critic`     | Skip the self-critique pass (cheaper, noisier).                  |
 | `lens analyze <id> --no-triage`     | Review every file, even lockfiles (rarely useful).               |
 | `lens analyze <id> --brief`         | Post a reviewer briefing to the forge before inline comments.    |
+| `lens scan`                         | Review local uncommitted/unpushed changes — no forge required.   |
+| `lens scan --base main`             | Override base branch for the local diff.                         |
+| `lens scan --effort high`           | Use stronger models for the local scan.                          |
 | `lens serve`                        | Launch the curation UI on `http://localhost:7777`.               |
 | `lens serve --port 8080`            | Use a different port.                                            |
+| `lens digest`                       | Print a 7-day activity digest (PRs, acceptance rate, cost).      |
+| `lens digest --days 30`             | Use a wider rolling window.                                      |
+| `lens digest --out report.md`       | Write the digest to a markdown file.                             |
 | `lens usage`                        | Per-provider summary (calls, tokens, cost).                      |
 | `lens usage --by-pr`                | Per-PR token + cost breakdown.                                   |
 | `lens usage --by-stage`             | Per-stage (triage / review / critic) breakdown.                  |
@@ -743,6 +762,12 @@ lens accuracy --category security
 lens accuracy --severity blocker
 ```
 
+### Accuracy auto-tuning
+
+Lens reads your acceptance history before each critic pass and injects calibration guidance automatically — no extra command needed. The critic is told to pull back on categories where you've historically rejected most suggestions (< 35% acceptance, ≥ 5 samples) and to be more confident on categories where you consistently accept comments (> 75% acceptance, ≥ 5 samples).
+
+This means the longer you use Lens, the quieter and more accurate the critic becomes — without any manual tuning.
+
 ---
 
 ## 14. Codebase-Aware Review
@@ -808,3 +833,142 @@ You can also add `lens index` to your git post-merge or post-checkout hook to ke
   }
 }
 ```
+
+---
+
+## 15. Local Scan (no forge)
+
+`lens scan` runs a full AI review on your local changes without needing a GitHub or Bitbucket account. It diffs your current branch against the detected base branch (`main`, `master`, or whatever your repo uses) and prints results directly to the terminal.
+
+### Usage
+
+```bash
+# review everything you haven't pushed yet
+lens scan
+
+# override base branch
+lens scan --base develop
+
+# heavier models
+lens scan --effort high
+
+# skip the critic pass for speed
+lens scan --no-critic
+```
+
+### When to use it
+
+- **Before opening a PR** — catch issues while still in your local branch.
+- **No forge credentials** — useful in CI environments, on open-source repos, or when evaluating Lens before setting up a token.
+- **Quick sanity check** — pair with `--effort low` for a 10-second once-over.
+
+### Output format
+
+```
+🔍 lens scan: reviewing local changes against main...
+
+── blockers (1) ──────────────────────────────────────
+src/auth/session.ts:87  [security/blocker]
+  Token stored in localStorage exposes it to XSS. Use httpOnly cookie instead.
+
+── concerns (2) ──────────────────────────────────────
+src/api/retry.ts:34  [correctness/concern]
+  Retry loop has no backoff — will hammer the endpoint under failure.
+
+src/db/migrate.ts:12  [data_integrity/concern]
+  Migration runs outside a transaction; partial failure leaves schema inconsistent.
+
+── suggestions (3) ───────────────────────────────────
+...
+```
+
+Lens sets `exit code 1` if any blockers are found, so you can gate CI on it:
+
+```bash
+lens scan --effort low || exit 1
+```
+
+---
+
+## 16. Weekly Digest
+
+`lens digest` generates a markdown summary of everything Lens did over the last N days — useful for team standups, retrospectives, or just knowing where your review time is going.
+
+### Usage
+
+```bash
+# print last 7 days to stdout
+lens digest
+
+# wider window
+lens digest --days 30
+
+# write to a file
+lens digest --out weekly-report.md
+```
+
+### Output example
+
+```markdown
+# lens digest — last 7 days
+> Generated 2026-05-07
+
+## Overview
+| Metric | Value |
+|--------|-------|
+| PRs seen | 12 |
+| Comments generated | 148 |
+| Comments accepted | 94 |
+| Comments rejected | 31 |
+| Acceptance rate | 75% |
+| Total tokens | 412,300 |
+| Estimated cost | $0.8241 |
+
+## Accepted comments by category
+- **correctness**: 38
+- **security**: 22
+- **maintainability**: 18
+- **data_integrity**: 16
+
+## Accepted comments by severity
+- **concern**: 51
+- **blocker**: 28
+- **suggestion**: 15
+
+## PRs reviewed
+| PR | Title | State | Cost |
+|----|-------|-------|------|
+| `gh:acme:api:142` | Add payment retry logic | merged | $0.1204 |
+| `gh:acme:api:139` | Refactor auth middleware | merged | $0.0892 |
+...
+```
+
+All data comes from the local SQLite database — no network calls.
+
+---
+
+## 17. Cross-PR Pattern Detection
+
+After every `lens analyze` run, Lens scans the last 10 analyses for comment themes that recur across multiple PRs and prints them alongside the review output. No AI call is needed — it uses phrase fingerprinting on your accepted comments.
+
+### What it looks like
+
+```
+## Recurring patterns (last 8 PRs)
+
+- **[security/blocker]** "Token stored in localstorage" — 4× across session.ts, auth.ts
+- **[correctness/concern]** "Missing await before async" — 3× across api.ts, retry.ts
+- **[data_integrity/concern]** "Migration runs outside transaction" — 2× across migrate.ts
+```
+
+### What to do with it
+
+Recurring patterns are the highest-signal input for your `.lens/skills.md`. If the same issue keeps appearing, add it as an explicit rule so the reviewer catches it earlier:
+
+```markdown
+# .lens/skills.md
+- All DB migrations must be wrapped in a transaction.
+- Never store auth tokens in localStorage — use httpOnly cookies.
+```
+
+Run `lens learn` to automate this mining process across your full PR history.
