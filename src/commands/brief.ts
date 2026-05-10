@@ -31,11 +31,17 @@ export async function briefPR(cfg: Config, prId: string, opts: BriefOpts = {}): 
 
   console.log('Generating briefing...');
   const pr = { title: prId, description: '' };
-  // try to get PR title from DB
+  let priorComments: Array<{ author: string; file: string; line: number | null; body: string }> = [];
   try {
     const { getDb } = await import('../db.js');
-    const row = getDb().prepare('SELECT title FROM pr WHERE id = ?').get(prId) as any;
+    const db = getDb();
+    const row = db.prepare('SELECT title FROM pr WHERE id = ?').get(prId) as any;
     if (row?.title) pr.title = row.title;
+    priorComments = db.prepare(
+      `SELECT author, file, line, body FROM reviewer_comment
+        WHERE forge=? AND workspace=? AND repo=? AND pr_number=?
+        ORDER BY file, line, created_at`,
+    ).all(ref.forge, ref.owner, ref.repo, ref.number) as any[];
   } catch { /* ok */ }
 
   const briefing = await generateBriefing(provider, {
@@ -44,6 +50,7 @@ export async function briefPR(cfg: Config, prId: string, opts: BriefOpts = {}): 
     diff,
     changedFiles,
     triageItems,
+    priorComments,
   });
 
   const markdown = formatBriefingMarkdown(briefing, pr.title);

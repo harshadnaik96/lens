@@ -2,19 +2,30 @@ import type { Provider } from './providers/types.js';
 import type { TriageItem } from './triage.js';
 import type { UsageInfo } from './providers/types.js';
 
+export interface PriorComment {
+  author: string;
+  file: string;
+  line: number | null;
+  body: string;
+}
+
 export interface BriefingInput {
   prTitle: string;
   prDescription: string;
   diff: string;
   changedFiles: string[];
   triageItems: TriageItem[];
+  /** Prior human reviewer comments on this PR, if any have been ingested. */
+  priorComments?: PriorComment[];
 }
 
 export interface Briefing {
   riskLevel: 'LOW' | 'MEDIUM' | 'HIGH';
+  riskRationale?: string;
   whatChanged: string[];
   focusAreas: Array<{ file: string; reason: string }>;
   safeToSkip: string[];
+  hotSpots?: Array<{ file: string; note: string }>;
   estimatedMinutes: number;
   usage?: UsageInfo;
 }
@@ -24,19 +35,28 @@ const BRIEFING_PROMPT = `You are a PR navigator. Your ONLY job is to help a huma
 Output a single JSON object (no prose around it):
 {
   "riskLevel": "LOW" | "MEDIUM" | "HIGH",
-  "whatChanged": ["3-5 bullet points in plain English describing what this PR does"],
-  "focusAreas": [{"file": "path/to/file", "reason": "why to spend time here"}],
+  "riskRationale": "one sentence naming the specific thing that drives this risk level (e.g. 'modifies the Stripe webhook signature check')",
+  "whatChanged": ["3-5 bullet points naming concrete behavior changes — refer to specific functions, endpoints, or modules. Avoid vague phrases like 'refactors X' or 'improves Y'."],
+  "focusAreas": [{"file": "path/to/file", "reason": "specific reason: a function name, an invariant, a tricky branch — not a category like 'security-relevant'"}],
   "safeToSkip": ["file or directory and why it is safe to skim"],
+  "hotSpots": [{"file": "path/to/file", "note": "what prior reviewers flagged here — only include if PRIOR_REVIEWER_COMMENTS section below has entries on this file"}],
   "estimatedMinutes": 15
 }
 
 Risk rubric:
-- HIGH: security-sensitive paths, core business logic, DB migrations, public API changes, auth
-- MEDIUM: moderate logic changes, internal API changes, non-trivial refactors
-- LOW: config tweaks, docs, minor additions, test-only changes, dependency bumps
+- HIGH: security-sensitive paths, core business logic, DB migrations, public API changes, auth, money/payment flows, anything touching user data at scale
+- MEDIUM: moderate logic changes, internal API changes, non-trivial refactors, new external dependencies
+- LOW: config tweaks, docs, minor additions, test-only changes, dependency patch bumps
 
-estimatedMinutes: total changed lines / 50, floored at 5, capped at 90.
-focusAreas: list only files worth a close read (deep-triaged, high-change-count, or security-relevant).
+Quality bar — these are the failure modes you must avoid:
+- Do NOT restate the PR title in whatChanged. Add information beyond the title.
+- Do NOT use generic reasons like "security-relevant" or "complex logic" — name the specific function, branch, or invariant.
+- Do NOT invent prior reviewer comments. Only populate hotSpots from the PRIOR_REVIEWER_COMMENTS section if present.
+- Do NOT pad focusAreas with files that are mechanical (renames, format-only). Quality > quantity; 1–4 entries is normal.
+
+estimatedMinutes: your own honest estimate based on cognitive load (unfamiliarity, branching complexity, surface area) — NOT a formula on line count. A 500-line rename is 5 minutes; a 30-line concurrency fix can be 45.
+
+focusAreas: list only files worth a close read.
 safeToSkip: lockfiles, generated code, trivial test additions, config-only changes.`;
 
 export async function generateBriefing(
@@ -49,7 +69,17 @@ export async function generateBriefing(
     .join('\n');
 
   const totalLines = (input.diff.match(/^[+-]/gm) ?? []).length;
-  const estimatedMinutes = Math.min(90, Math.max(5, Math.round(totalLines / 50)));
+
+  // Build a compact prior-comments block. Cap to the most recent 20 to keep
+  // the prompt tight, and trim each body to 280 chars — we just need a hint.
+  const priorComments = (input.priorComments ?? []).slice(-20);
+  const priorBlock = priorComments.length === 0
+    ? '(none ingested)'
+    : priorComments.map((c) => {
+        const where = c.file + (c.line ? ':' + c.line : '');
+        const body = c.body.length > 280 ? c.body.slice(0, 277) + '...' : c.body;
+        return `- ${c.author} on \`${where}\`: ${body.replace(/\s+/g, ' ').trim()}`;
+      }).join('\n');
 
   const userBody = `PR Title: ${input.prTitle}
 PR Description: ${input.prDescription || '(none)'}
@@ -60,8 +90,10 @@ ${filesList}
 Triage decisions:
 ${triageSummary}
 
-Estimated changed lines: ${totalLines}
-Suggested estimatedMinutes: ${estimatedMinutes}
+PRIOR_REVIEWER_COMMENTS (already on this PR — use to populate hotSpots; do NOT invent):
+${priorBlock}
+
+Diff size: ${totalLines} changed lines. Use as one signal for review time, not the only one.
 
 Return ONLY the JSON object.`;
 
@@ -91,22 +123,32 @@ Return ONLY the JSON object.`;
     if (start !== -1 && end !== -1) parsed = JSON.parse(candidate.slice(start, end + 1));
   } catch { /* use defaults */ }
 
+  // Sanity-clamp the model's estimate so a hallucinated 9999 doesn't reach the UI.
+  const rawMinutes = typeof parsed.estimatedMinutes === 'number' ? parsed.estimatedMinutes : 15;
+  const estimatedMinutes = Math.min(120, Math.max(2, Math.round(rawMinutes)));
+
   return {
     riskLevel: (['LOW', 'MEDIUM', 'HIGH'].includes(parsed.riskLevel) ? parsed.riskLevel : 'MEDIUM') as Briefing['riskLevel'],
+    riskRationale: typeof parsed.riskRationale === 'string' ? parsed.riskRationale : undefined,
     whatChanged: Array.isArray(parsed.whatChanged) ? parsed.whatChanged : [],
     focusAreas: Array.isArray(parsed.focusAreas) ? parsed.focusAreas : [],
     safeToSkip: Array.isArray(parsed.safeToSkip) ? parsed.safeToSkip : [],
-    estimatedMinutes: typeof parsed.estimatedMinutes === 'number' ? parsed.estimatedMinutes : estimatedMinutes,
+    hotSpots: Array.isArray(parsed.hotSpots) ? parsed.hotSpots : [],
+    estimatedMinutes,
     usage: result.usage,
   };
 }
 
 export function formatBriefingMarkdown(briefing: Briefing, prTitle: string): string {
   const riskEmoji = { LOW: '🟢', MEDIUM: '🟡', HIGH: '🔴' }[briefing.riskLevel];
+  const riskLine = briefing.riskRationale
+    ? `**Risk:** ${riskEmoji} ${briefing.riskLevel} — ${briefing.riskRationale} &nbsp;|&nbsp; **Estimated review time:** ~${briefing.estimatedMinutes} min`
+    : `**Risk:** ${riskEmoji} ${briefing.riskLevel} &nbsp;|&nbsp; **Estimated review time:** ~${briefing.estimatedMinutes} min`;
+
   const lines: string[] = [
     `## 🔍 Reviewer Briefing — ${prTitle}`,
     '',
-    `**Risk:** ${riskEmoji} ${briefing.riskLevel} &nbsp;|&nbsp; **Estimated review time:** ~${briefing.estimatedMinutes} min`,
+    riskLine,
     '',
     '### What changed',
     ...briefing.whatChanged.map((b) => `- ${b}`),
@@ -115,6 +157,11 @@ export function formatBriefingMarkdown(briefing: Briefing, prTitle: string): str
   if (briefing.focusAreas.length > 0) {
     lines.push('', '### Focus here');
     for (const f of briefing.focusAreas) lines.push(`- **${f.file}** — ${f.reason}`);
+  }
+
+  if (briefing.hotSpots && briefing.hotSpots.length > 0) {
+    lines.push('', '### Hot spots from prior reviews');
+    for (const h of briefing.hotSpots) lines.push(`- **${h.file}** — ${h.note}`);
   }
 
   if (briefing.safeToSkip.length > 0) {
