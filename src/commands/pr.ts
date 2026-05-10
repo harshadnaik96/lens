@@ -10,7 +10,7 @@ import { triage, type TriageItem } from '../triage.js';
 import { extractContext, buildContextBlock } from '../context.js';
 import { detectRelevantLenses, formatLenses } from '../lens_detect.js';
 import { estimateCost, fmtUsd } from '../pricing.js';
-import type { UsageInfo, ReviewComment } from '../providers/types.js';
+import type { UsageInfo, ReviewComment, AgentEvent } from '../providers/types.js';
 import { queryBlastRadius, formatBlastRadius } from '../indexer.js';
 import { detectRepoRoot } from '../local_diff.js';
 import { detectCrossPatterns, formatPatternReport } from '../pattern_detect.js';
@@ -34,7 +34,46 @@ export interface PipelineOpts {
   effort?: Effort;
   onLog?: (msg: string) => void;
   onTriage?: (items: TriageItem[]) => void;
+  onStage?: (e: StageEvent) => void;
+  onAgentEvent?: (stage: string, e: AgentEvent) => void;
+  signal?: AbortSignal;
   repoRoot?: string;
+  /** Existing reviewer comments from the forge — already-said human signal
+   *  the model should not duplicate. Caller queries reviewer_comment and
+   *  hands them in so the pipeline stays free of DB-shape concerns. */
+  priorReviewerComments?: Array<{ author: string; file: string; line: number | null; body: string; created_at: string | null }>;
+}
+
+/**
+ * Ordered pipeline stages with weights (sum = 100). Used by the dashboard to
+ * render a per-PR progress bar without relying on wall-clock estimates only.
+ * Weights are tuned guesses; refine from usage_log.ms_elapsed averages later.
+ */
+export type StageGroup = 'triage' | 'review';
+
+export const PIPELINE_STAGES: ReadonlyArray<{ id: string; label: string; weight: number; group: StageGroup }> = [
+  { id: 'fetch',    label: 'Fetch diff & metadata',    weight: 5,  group: 'triage' },
+  { id: 'triage',   label: 'Pick files to review',     weight: 10, group: 'triage' },
+  { id: 'context',  label: 'Read related code',        weight: 5,  group: 'triage' },
+  { id: 'blast',    label: 'Score risk',               weight: 5,  group: 'triage' },
+  { id: 'lenses',   label: 'Read prior comments',      weight: 3,  group: 'triage' },
+  { id: 'review',   label: 'Draft comments',           weight: 35, group: 'review' },
+  { id: 'critic',   label: 'Self-critique',            weight: 30, group: 'review' },
+  { id: 'persist',  label: 'Save to draft',            weight: 7,  group: 'review' },
+];
+
+export const PIPELINE_GROUPS: ReadonlyArray<{ id: StageGroup; label: string }> = [
+  { id: 'triage', label: 'Triage' },
+  { id: 'review', label: 'Review' },
+];
+
+export type StageStatus = 'pending' | 'running' | 'done' | 'skipped' | 'error';
+
+export interface StageEvent {
+  stage: string;
+  status: StageStatus;
+  detail?: string;
+  ts: number;
 }
 
 export interface PipelineResult {
@@ -54,6 +93,17 @@ export async function runAnalysisPipeline(
 ): Promise<PipelineResult> {
   const logger = new Logger(opts.onLog);
   const provider = getProvider(cfg, opts.providerOverride);
+  const stage = (id: string, status: StageStatus, detail?: string) => {
+    if (opts.onStage) opts.onStage({ stage: id, status, detail, ts: Date.now() });
+  };
+  const agentRelay = (s: string) => (e: AgentEvent) => { if (opts.onAgentEvent) opts.onAgentEvent(s, e); };
+  const checkAbort = () => {
+    if (opts.signal?.aborted) {
+      const err: any = new Error('Analysis cancelled');
+      err.name = 'AbortError';
+      throw err;
+    }
+  };
 
   const ok = await provider.isAvailable();
   if (!ok) throw new Error(`provider ${provider.name} not available on PATH`);
@@ -70,12 +120,16 @@ export async function runAnalysisPipeline(
   if (opts.skipTriage) {
     triageItems = fileDiffs.map((f) => ({ path: f.path, decision: 'deep' as const, reason: 'triage skipped', source: 'heuristic' as const }));
     logger.log(`triage: skipped by user option`);
+    stage('triage', 'skipped');
   } else {
+    checkAbort();
     logger.log(`triage: classifying ${fileDiffs.length} files...`);
+    stage('triage', 'running', `${fileDiffs.length} files`);
     const tt0 = Date.now();
     const tres = await triage(provider, fileDiffs, models.triage);
     triageItems = tres.items;
     stageUsages.push({ stage: 'triage', model: models.triage, usage: tres.usage, ms: Date.now() - tt0 });
+    stage('triage', 'done');
     if (opts.onTriage) opts.onTriage(triageItems);
     const counts = triageItems.reduce<Record<string, number>>((acc, t) => {
       acc[t.decision] = (acc[t.decision] ?? 0) + 1; return acc;
@@ -98,27 +152,49 @@ export async function runAnalysisPipeline(
     };
   }
 
+  stage('context', 'running');
   const deepPaths = new Set(triageItems.filter((t) => t.decision === 'deep').map((t) => t.path));
   const contexts = reviewableFiles.filter((f) => deepPaths.has(f.path)).map(extractContext);
   let contextBlock = buildContextBlock(contexts);
   if (contextBlock) logger.log(`context: extracted symbols/imports for ${contexts.filter((c) => c.imports.length || c.symbols.length).length} deep files`);
+  stage('context', 'done');
 
   // Opportunistic blast radius — only if index exists for this repo
+  let blastFired = false;
   try {
     const repoRoot = await detectRepoRoot(opts.repoRoot ? undefined : process.cwd());
     const exportedSymbols = contexts.flatMap((c) => c.symbols);
     if (exportedSymbols.length > 0) {
+      stage('blast', 'running');
+      blastFired = true;
       const br = queryBlastRadius(repoRoot, exportedSymbols);
       const brBlock = formatBlastRadius(br, changedFiles);
       if (brBlock) {
         contextBlock = contextBlock ? contextBlock + '\n\n' + brBlock : brBlock;
         logger.log(`blast radius: ${br.callSiteCounts.size} impacted symbol(s), ${br.dependentFiles.length} dependent file(s)`);
       }
+      stage('blast', 'done');
     }
   } catch { /* no index or not in a git repo — skip silently */ }
+  if (!blastFired) stage('blast', 'skipped');
 
+  // Existing reviewer comments — pulled from the forge at sync time and
+  // stored in reviewer_comment. These are real human review notes from prior
+  // iterations of this PR (or earlier discussion on the same lines), so the
+  // model should see them: it can avoid re-raising already-addressed points,
+  // pile on where humans agree, or push back when humans missed something.
+  const changedFilesSet = new Set(reviewableFiles.map((f) => f.path));
+  const reviewerComments = opts.priorReviewerComments ?? [];
+  const reviewerBlock = formatReviewerCommentsBlock(reviewerComments, changedFilesSet);
+  if (reviewerBlock) {
+    contextBlock = contextBlock ? contextBlock + '\n\n' + reviewerBlock : reviewerBlock;
+    logger.log(`reviewer comments: ${reviewerComments.length} prior comment(s) injected as context`);
+  }
+
+  stage('lenses', 'running');
   const lenses = detectRelevantLenses(reviewableDiff, contexts, allFiles);
   logger.log(`lenses: ${formatLenses(lenses)}`);
+  stage('lenses', 'done');
 
   const skills = loadSkills(allFiles, undefined, lenses);
   const reviewInput = {
@@ -132,10 +208,18 @@ export async function runAnalysisPipeline(
     lenses,
   };
 
+  checkAbort();
   logger.log(`pass 1: ${provider.name} candidate review on ${reviewableFiles.length} files...`);
+  stage('review', 'running', `${reviewableFiles.length} files`);
   const reviewT0 = Date.now();
-  const candidate = await provider.review(reviewInput, { model: models.review });
+  const candidate = await provider.review(reviewInput, {
+    model: models.review,
+    stage: 'review',
+    onAgentEvent: opts.onAgentEvent ? agentRelay('review') : undefined,
+    signal: opts.signal,
+  });
   stageUsages.push({ stage: 'review', model: models.review, usage: candidate.usage, ms: Date.now() - reviewT0 });
+  stage('review', 'done', `${candidate.comments.length} comments`);
 
   if (candidate.thinkingText) {
     logger.log(`\n--- REVIEW MODEL THINKING ---\n${candidate.thinkingText}\n--- END THINKING ---`);
@@ -151,18 +235,28 @@ export async function runAnalysisPipeline(
       .map((f) => annotateDiff(f.body))
       .join('');
     const criticInput = { ...reviewInput, diff: criticDiff };
+    checkAbort();
     logger.log(`\npass 2: critic refining ${candidate.comments.length} candidate comments across ${commentedPaths.size} file(s)...`);
+    stage('critic', 'running', `${candidate.comments.length} comments`);
     const ct0 = Date.now();
     try {
-      result = await critique(provider, criticInput, candidate, models.critic);
+      result = await critique(provider, criticInput, candidate, models.critic, {
+        stage: 'critic',
+        onAgentEvent: opts.onAgentEvent ? agentRelay('critic') : undefined,
+        signal: opts.signal,
+      });
       stageUsages.push({ stage: 'critic', model: models.critic, usage: result.usage, ms: Date.now() - ct0 });
+      stage('critic', 'done', `${result.comments.length} comments`);
       if (result.thinkingText) {
         logger.log(`\n--- CRITIC MODEL THINKING ---\n${result.thinkingText}\n--- END THINKING ---`);
       }
       if (result.usage) logger.log(`  critic tokens: ${result.usage.tokens_in} in / ${result.usage.tokens_out} out (${result.usage.source})`);
     } catch (err: any) {
       logger.log(`critic pass failed (${err.message}); using candidate as-is`);
+      stage('critic', 'error', err.message);
     }
+  } else {
+    stage('critic', 'skipped');
   }
 
   logger.log(`Summary: ${result.summary.slice(0, 100)}...`);
@@ -181,13 +275,14 @@ export async function listPRs(cfg: Config) {
   const prs = await forge.listOpenPRs();
   const db = initDb();
   const upsert = db.prepare(`
-    INSERT INTO pr (id, forge, workspace, repo, number, url, title, author, source_branch, dest_branch, state, updated_at)
+    INSERT INTO pr (id, forge, workspace, repo, number, url, title, author, source_branch, dest_branch, state, updated_at, forge_state, is_draft)
     VALUES (@id, @forge, @ws, @repo, @num, @url, @title, @author, @src, @dst,
-            COALESCE((SELECT state FROM pr WHERE id=@id),'NEW'), @updated)
+            COALESCE((SELECT state FROM pr WHERE id=@id),'NEW'), @updated, @forgeState, @isDraft)
     ON CONFLICT(id) DO UPDATE SET
       title=excluded.title, author=excluded.author, url=excluded.url,
       source_branch=excluded.source_branch, dest_branch=excluded.dest_branch,
-      updated_at=excluded.updated_at
+      updated_at=excluded.updated_at,
+      forge_state=excluded.forge_state, is_draft=excluded.is_draft
   `);
   for (const p of prs) {
     upsert.run({
@@ -202,12 +297,68 @@ export async function listPRs(cfg: Config) {
       src: p.sourceBranch,
       dst: p.destBranch,
       updated: p.updatedOn,
+      forgeState: p.forgeState ?? 'OPEN',
+      isDraft: p.isDraft ? 1 : 0,
     });
   }
   console.log(`${prs.length} open PRs:`);
   for (const p of prs) {
     const branches = p.sourceBranch ? `  ${p.sourceBranch} → ${p.destBranch}` : '';
     console.log(`  ${refToId(p.ref).padEnd(40)}  ${p.title}  (${p.author})${branches}`);
+  }
+
+  // Pull existing reviewer comments per PR (concurrency 5) and store in
+  // reviewer_comment so the PR detail page and review prompt can use them as
+  // context. Failures per PR are silently swallowed — comment ingestion is
+  // best-effort, not load-bearing for the sync.
+  const insertComment = db.prepare(`
+    INSERT OR IGNORE INTO reviewer_comment (forge, workspace, repo, pr_number, pr_title, author, file, line, body, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  let totalComments = 0;
+  for (let i = 0; i < prs.length; i += 5) {
+    const chunk = prs.slice(i, i + 5);
+    await Promise.all(chunk.map(async (p) => {
+      try {
+        const comments = await forge.getReviewComments(p.ref);
+        for (const c of comments) {
+          if (!c.body.trim()) continue;
+          insertComment.run(p.ref.forge, p.ref.owner, p.ref.repo, p.ref.number, p.title, c.author, c.file, c.line, c.body, c.createdAt);
+          totalComments++;
+        }
+      } catch { /* skip failed PRs */ }
+    }));
+  }
+  if (totalComments > 0) console.log(`  Ingested ${totalComments} existing reviewer comment(s).`);
+
+  // Refresh forge_state for PRs that *were* open but dropped off the list.
+  // listOpenPRs only returns OPEN/DRAFT, so once a PR is merged or declined,
+  // its row would otherwise stay stuck at the last-known forge_state forever.
+  // Fetch each stale row's current state directly (concurrency 5).
+  const seenIds = new Set(prs.map((p) => refToId(p.ref)));
+  const staleRows = db.prepare(`
+    SELECT id, forge, workspace, repo, number
+    FROM pr
+    WHERE forge_state IN ('OPEN','DRAFT') OR forge_state IS NULL
+  `).all() as Array<{ id: string; forge: string; workspace: string; repo: string; number: number }>;
+  const stale = staleRows.filter((r) => !seenIds.has(r.id));
+  if (stale.length > 0) {
+    const updateStale = db.prepare(`UPDATE pr SET forge_state=?, is_draft=? WHERE id=?`);
+    let refreshed = 0, transitioned = 0;
+    for (let i = 0; i < stale.length; i += 5) {
+      const chunk = stale.slice(i, i + 5);
+      await Promise.all(chunk.map(async (r) => {
+        try {
+          const ref = { forge: r.forge as 'github' | 'bitbucket', owner: r.workspace, repo: r.repo, number: r.number };
+          const s = await forge.getPRSummary(ref);
+          if (!s) return;
+          updateStale.run(s.forgeState ?? 'OPEN', s.isDraft ? 1 : 0, r.id);
+          refreshed++;
+          if (s.forgeState && s.forgeState !== 'OPEN' && s.forgeState !== 'DRAFT') transitioned++;
+        } catch { /* skip — forge errors shouldn't fail the whole sync */ }
+      }));
+    }
+    if (transitioned > 0) console.log(`  Refreshed ${refreshed} stale PR state(s) — ${transitioned} merged/closed since last sync.`);
   }
 }
 
@@ -221,6 +372,9 @@ export interface AnalyzeOpts {
   effort?: Effort;
   onLog?: (msg: string) => void;
   onTriage?: (items: TriageItem[]) => void;
+  onStage?: (e: StageEvent) => void;
+  onAgentEvent?: (stage: string, e: AgentEvent) => void;
+  signal?: AbortSignal;
 }
 
 interface StageModels { triage?: string; review?: string; critic?: string; }
@@ -245,12 +399,17 @@ export async function analyzePR(cfg: Config, prId: string, opts: AnalyzeOpts = {
   const models = resolveModels(cfg, opts.effort);
 
   recordTransition(prId, 'ANALYZING');
+  const stage = (id: string, status: StageStatus, detail?: string) => {
+    if (opts.onStage) opts.onStage({ stage: id, status, detail, ts: Date.now() });
+  };
+  stage('fetch', 'running');
   logger.log(`fetching diff and existing comments for ${prId}...`);
   const [diff, existingComments] = await Promise.all([
     forge.getDiff(ref),
     forge.getComments(ref),
   ]);
   if (existingComments.length) logger.log(`  → ${existingComments.length} existing inline comment(s) fetched`);
+  stage('fetch', 'done');
 
   // Handle reAnalyze cached triage before delegating to pipeline
   const fileDiffs = splitDiffByFile(diff);
@@ -283,6 +442,13 @@ export async function analyzePR(cfg: Config, prId: string, opts: AnalyzeOpts = {
   // for the pipeline path, we pass empty and let it triage fresh)
   const prDescription = cachedTriageItems ? triageContextForPrompt(cachedTriageItems) : '';
 
+  const priorReviewerComments = db.prepare(`
+    SELECT author, file, line, body, created_at
+    FROM reviewer_comment
+    WHERE forge=? AND workspace=? AND repo=? AND pr_number=?
+    ORDER BY file, line, created_at
+  `).all(ref.forge, ref.owner, ref.repo, ref.number) as Array<{ author: string; file: string; line: number | null; body: string; created_at: string | null }>;
+
   let reviewResult: PipelineResult;
   try {
     reviewResult = await runAnalysisPipeline(cfg, diff, fileDiffs.map(f => f.path), '(see forge)', prDescription, {
@@ -292,6 +458,10 @@ export async function analyzePR(cfg: Config, prId: string, opts: AnalyzeOpts = {
       effort: opts.effort,
       onLog: opts.onLog,
       onTriage: cachedTriageItems ? undefined : opts.onTriage,
+      onStage: opts.onStage,
+      onAgentEvent: opts.onAgentEvent,
+      signal: opts.signal,
+      priorReviewerComments,
     });
   } catch (err: any) {
     db.prepare(
@@ -321,6 +491,7 @@ export async function analyzePR(cfg: Config, prId: string, opts: AnalyzeOpts = {
     rawResponse: '',
   };
 
+  stage('persist', 'running');
   let aid: number;
   if (opts.reAnalyze) {
     aid = mergeReanalysis(db, prId, resultForPersist, logger.getLogs());
@@ -346,6 +517,7 @@ export async function analyzePR(cfg: Config, prId: string, opts: AnalyzeOpts = {
   }
 
   recordTransition(prId, 'DRAFT_READY');
+  stage('persist', 'done');
 
   logger.log(`Summary: ${reviewResult.summary.slice(0, 100)}...`);
   logger.log(`${reviewResult.comments.length} draft comments saved.`);
@@ -480,6 +652,47 @@ function loadCachedTriage(
       reason: r.reason,
       source: r.source as TriageItem['source'],
     }));
+}
+
+function formatReviewerCommentsBlock(
+  comments: Array<{ author: string; file: string; line: number | null; body: string; created_at: string | null }>,
+  changedFiles: Set<string>,
+): string {
+  if (comments.length === 0) return '';
+
+  // Truncate aggressively — long quoted threads can blow the prompt.
+  const MAX_BODY = 600;
+  const MAX_COMMENTS = 30;
+  const onChanged = comments.filter((c) => c.file && changedFiles.has(c.file));
+  const offChanged = comments.filter((c) => !c.file || !changedFiles.has(c.file));
+  // Prioritize comments on files in this PR; only spill to others if budget allows.
+  const picked = [...onChanged, ...offChanged].slice(0, MAX_COMMENTS);
+
+  const lines: string[] = [
+    '## Existing Reviewer Comments',
+    '> Real human review notes from this PR (and prior iterations). Treat these as authoritative human signal:',
+    '> - If a point you would raise is already raised here, do **not** repeat it.',
+    '> - If a reviewer flagged something the author already addressed, do not bring it back up.',
+    '> - If you disagree with a reviewer\'s comment based on the current diff, you may push back — but acknowledge the prior comment.',
+    '',
+  ];
+
+  for (const c of picked) {
+    const where = c.file ? `${c.file}${c.line ? ':' + c.line : ''}` : '(top-level)';
+    let body = (c.body ?? '').trim().replace(/\r\n/g, '\n');
+    if (body.length > MAX_BODY) body = body.slice(0, MAX_BODY) + '… [truncated]';
+    // Quote each line so multi-line bodies stay readable in the prompt.
+    const quoted = body.split('\n').map((l) => '> ' + l).join('\n');
+    lines.push(`**${c.author}** on \`${where}\`:`);
+    lines.push(quoted);
+    lines.push('');
+  }
+
+  if (comments.length > MAX_COMMENTS) {
+    lines.push(`_…and ${comments.length - MAX_COMMENTS} more comment(s) not shown._`);
+  }
+
+  return lines.join('\n');
 }
 
 function recordTransition(prId: string, to: string, note?: string) {

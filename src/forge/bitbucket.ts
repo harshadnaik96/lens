@@ -119,6 +119,8 @@ export class BitbucketForge implements Forge {
         destBranch: v.destination?.branch?.name ?? "",
         updatedOn: v.updated_on,
         url: v.links?.html?.href,
+        forgeState: bbForgeState(v),
+        isDraft: !!v.draft,
       };
     });
   }
@@ -221,6 +223,25 @@ export class BitbucketForge implements Forge {
     return allPRs.slice(0, limit);
   }
 
+  async getPRSummary(ref: PRRef): Promise<PRSummary | null> {
+    const res = await request(this.repoUrl(ref, `/pullrequests/${ref.number}`), { headers: this.headers() });
+    if (res.statusCode === 404) return null;
+    if (res.statusCode >= 400) throw new Error(`Bitbucket PR ${ref.number} ${res.statusCode}: ${await res.body.text()}`);
+    const v = (await res.body.json()) as any;
+    return {
+      ref,
+      title: v.title,
+      author: v.author?.display_name ?? 'unknown',
+      state: v.state,
+      sourceBranch: v.source?.branch?.name ?? '',
+      destBranch: v.destination?.branch?.name ?? '',
+      updatedOn: v.updated_on,
+      url: v.links?.html?.href,
+      forgeState: bbForgeState(v),
+      isDraft: !!v.draft,
+    };
+  }
+
   async getReviewComments(ref: PRRef): Promise<ReviewComment[]> {
     const res = await request(this.repoUrl(ref, `/pullrequests/${ref.number}/comments?pagelen=100`), { headers: this.headers() });
     if (res.statusCode >= 400) return [];
@@ -236,4 +257,12 @@ export class BitbucketForge implements Forge {
         createdAt: c.created_on ?? '',
       }));
   }
+}
+
+function bbForgeState(v: any): 'OPEN' | 'DRAFT' | 'MERGED' | 'CLOSED' {
+  const s = String(v.state ?? '').toUpperCase();
+  if (v.draft === true) return 'DRAFT';
+  if (s === 'MERGED') return 'MERGED';
+  if (s === 'DECLINED' || s === 'SUPERSEDED') return 'CLOSED';
+  return 'OPEN';
 }

@@ -14,6 +14,9 @@ export interface PRSummary {
   destBranch: string;
   updatedOn: string;
   url?: string; // web URL
+  /** Forge-native lifecycle state, normalized: OPEN | DRAFT | MERGED | CLOSED. */
+  forgeState?: 'OPEN' | 'DRAFT' | 'MERGED' | 'CLOSED';
+  isDraft?: boolean;
 }
 
 export interface PRComment {
@@ -48,6 +51,9 @@ export interface Forge {
   postTopLevelComment(ref: PRRef, body: string): Promise<unknown>;
   getMergedPRs(limit: number): Promise<PRSummary[]>;
   getReviewComments(ref: PRRef): Promise<ReviewComment[]>;
+  /** Fetch the current state of a single PR (regardless of open/closed/merged).
+   *  Used to refresh forge_state for PRs that have dropped off the open-list. */
+  getPRSummary(ref: PRRef): Promise<PRSummary | null>;
 }
 
 /** Composite id we store in DB and accept on the CLI: `{forge}:{owner}:{repo}:{number}` */

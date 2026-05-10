@@ -1,4 +1,4 @@
-import type { Provider, ReviewInput, ReviewOutput } from './providers/types.js';
+import type { Provider, ReviewInput, ReviewOutput, ReviewOpts } from './providers/types.js';
 import { ReviewOutputSchema } from './providers/types.js';
 import { buildAccuracyGuidance } from './accuracy_tuning.js';
 
@@ -51,6 +51,7 @@ export async function critique(
   input: ReviewInput,
   candidate: ReviewOutput,
   model?: string,
+  extraOpts?: Pick<ReviewOpts, 'onAgentEvent' | 'stage' | 'signal'>,
 ): Promise<ReviewOutput> {
   const { guidance } = buildAccuracyGuidance();
   const tuningBlock = guidance ? `\n\n${guidance}` : '';
@@ -75,7 +76,7 @@ Return ONLY the corrected JSON.`;
     skills: '',
     prTitle: input.prTitle,
     prDescription: 'Critique pass — see prompt body.',
-  }, { model });
+  }, { model, ...extraOpts });
 
   try {
     const parsed = ReviewOutputSchema.parse({

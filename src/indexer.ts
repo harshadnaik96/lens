@@ -2,10 +2,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getDb } from './db.js';
 
+export interface IndexProgress {
+  phase: 'walk' | 'defs' | 'calls' | 'done';
+  filesScanned: number;
+  filesTotal: number;
+  symbolsFound: number;
+  callSitesFound: number;
+}
+
 export interface IndexOpts {
   repoRoot: string;
   languages?: string[];
   excludeDirs?: string[];
+  onProgress?: (p: IndexProgress) => void;
 }
 
 export interface IndexStats {
@@ -139,17 +148,22 @@ export async function buildIndex(opts: IndexOpts): Promise<IndexStats> {
   const langs = new Set(opts.languages ?? Object.keys(DEF_PATTERNS));
   const exts = new Set(Object.entries(EXT_LANG).filter(([, l]) => langs.has(l)).map(([e]) => e));
   const excludeDirs = new Set(opts.excludeDirs ?? ['node_modules', 'vendor', 'dist', 'build', '.next', '.git']);
+  const emit = opts.onProgress ?? (() => {});
 
   // clear existing index for this repo
   db.prepare('DELETE FROM symbol_index WHERE repo_root = ?').run(opts.repoRoot);
 
+  emit({ phase: 'walk', filesScanned: 0, filesTotal: 0, symbolsFound: 0, callSitesFound: 0 });
   const files = walkDir(opts.repoRoot, excludeDirs, exts);
+  const filesTotal = files.length;
+  emit({ phase: 'walk', filesScanned: filesTotal, filesTotal, symbolsFound: 0, callSitesFound: 0 });
 
   // pass 1: collect all defined symbols across repo
   const allDefs = new Map<string, Array<{ file: string; line: number; lang: string }>>();
+  let scanned = 0, symbolsRunning = 0;
   for (const file of files) {
     let content: string;
-    try { content = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    try { content = fs.readFileSync(file, 'utf8'); } catch { scanned++; continue; }
     const ext = file.split('.').pop()?.toLowerCase() ?? '';
     const lang = EXT_LANG[ext] ?? 'other';
     const relFile = path.relative(opts.repoRoot, file);
@@ -158,8 +172,15 @@ export async function buildIndex(opts: IndexOpts): Promise<IndexStats> {
       const existing = allDefs.get(d.symbol) ?? [];
       existing.push({ file: relFile, line: d.line, lang });
       allDefs.set(d.symbol, existing);
+      symbolsRunning++;
+    }
+    scanned++;
+    // Emit every ~64 files to avoid flooding listeners.
+    if ((scanned & 63) === 0) {
+      emit({ phase: 'defs', filesScanned: scanned, filesTotal, symbolsFound: symbolsRunning, callSitesFound: 0 });
     }
   }
+  emit({ phase: 'defs', filesScanned: scanned, filesTotal, symbolsFound: symbolsRunning, callSitesFound: 0 });
 
   const definedSymbols = new Set(allDefs.keys());
 
@@ -179,9 +200,10 @@ export async function buildIndex(opts: IndexOpts): Promise<IndexStats> {
     }
 
     // insert calls
+    let cscan = 0;
     for (const file of files) {
       let content: string;
-      try { content = fs.readFileSync(file, 'utf8'); } catch { continue; }
+      try { content = fs.readFileSync(file, 'utf8'); } catch { cscan++; continue; }
       const ext = file.split('.').pop()?.toLowerCase() ?? '';
       const lang = EXT_LANG[ext] ?? 'other';
       const relFile = path.relative(opts.repoRoot, file);
@@ -190,9 +212,14 @@ export async function buildIndex(opts: IndexOpts): Promise<IndexStats> {
         insertStmt.run(opts.repoRoot, relFile, c.symbol, 'call', lang, c.line);
         totalCalls++;
       }
+      cscan++;
+      if ((cscan & 63) === 0) {
+        emit({ phase: 'calls', filesScanned: cscan, filesTotal, symbolsFound: totalSymbols, callSitesFound: totalCalls });
+      }
     }
   })();
 
+  emit({ phase: 'done', filesScanned: filesTotal, filesTotal, symbolsFound: totalSymbols, callSitesFound: totalCalls });
   return { files: files.length, symbols: totalSymbols, callSites: totalCalls, durationMs: Date.now() - start };
 }
 

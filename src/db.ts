@@ -132,6 +132,42 @@ export function initDb(): Database.Database {
 
     CREATE INDEX IF NOT EXISTS idx_symbol_index_repo_file
       ON symbol_index(repo_root, file);
+
+    CREATE TABLE IF NOT EXISTS review_session (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pr_id TEXT NOT NULL,
+      started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      ended_at TEXT,
+      status TEXT NOT NULL DEFAULT 'running',
+      trigger TEXT,
+      provider TEXT,
+      model TEXT,
+      cancelled INTEGER DEFAULT 0,
+      error TEXT,
+      final_percent INTEGER,
+      tokens_in INTEGER,
+      tokens_out INTEGER,
+      cost_usd REAL,
+      analysis_id INTEGER,
+      FOREIGN KEY(pr_id) REFERENCES pr(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_review_session_pr
+      ON review_session(pr_id, started_at DESC);
+
+    CREATE TABLE IF NOT EXISTS review_event (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id INTEGER NOT NULL,
+      seq INTEGER NOT NULL,
+      ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      kind TEXT NOT NULL,
+      stage TEXT,
+      payload TEXT,
+      FOREIGN KEY(session_id) REFERENCES review_session(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_review_event_session
+      ON review_event(session_id, seq);
   `);
 
   // Defensive ALTERs for existing dbs upgraded from older schema.
@@ -149,6 +185,10 @@ export function initDb(): Database.Database {
     `ALTER TABLE usage_log ADD COLUMN cost_usd REAL`,
     `ALTER TABLE usage_log ADD COLUMN stage TEXT`,
     `ALTER TABLE usage_log ADD COLUMN model TEXT`,
+    `ALTER TABLE pr ADD COLUMN last_heartbeat_at TEXT`,
+    `ALTER TABLE pr ADD COLUMN forge_state TEXT`,
+    `ALTER TABLE pr ADD COLUMN is_draft INTEGER DEFAULT 0`,
+    `ALTER TABLE reviewer_comment ADD COLUMN created_at TEXT`,
   ]) {
     try { db.exec(stmt); } catch { /* column already exists */ }
   }

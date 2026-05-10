@@ -50,6 +50,8 @@ export class GitHubForge implements Forge {
         destBranch: p.base?.ref ?? '',
         updatedOn: p.updated_at,
         url: p.html_url,
+        forgeState: ghForgeState(p),
+        isDraft: !!p.draft,
       }));
     }
 
@@ -71,6 +73,8 @@ export class GitHubForge implements Forge {
         destBranch: '',
         updatedOn: p.updated_at,
         url: p.html_url,
+        forgeState: ghForgeState(p),
+        isDraft: !!(p.draft ?? p.pull_request?.draft),
       };
     });
   }
@@ -149,6 +153,25 @@ export class GitHubForge implements Forge {
     });
   }
 
+  async getPRSummary(ref: PRRef): Promise<PRSummary | null> {
+    const res = await request(this.repoUrl(ref, `/pulls/${ref.number}`), { headers: await this.headers() });
+    if (res.statusCode === 404) return null;
+    if (res.statusCode >= 400) throw new Error(`GitHub PR ${ref.number} ${res.statusCode}: ${await res.body.text()}`);
+    const p = (await res.body.json()) as any;
+    return {
+      ref,
+      title: p.title,
+      author: p.user?.login ?? 'unknown',
+      state: p.state,
+      sourceBranch: p.head?.ref ?? '',
+      destBranch: p.base?.ref ?? '',
+      updatedOn: p.updated_at,
+      url: p.html_url,
+      forgeState: ghForgeState(p),
+      isDraft: !!p.draft,
+    };
+  }
+
   async getReviewComments(ref: PRRef): Promise<ReviewComment[]> {
     const res = await request(this.repoUrl(ref, `/pulls/${ref.number}/comments?per_page=100`), { headers: await this.headers() });
     if (res.statusCode >= 400) throw new Error(`GitHub getReviewComments ${res.statusCode}: ${await res.body.text()}`);
@@ -166,6 +189,19 @@ export class GitHubForge implements Forge {
 
 function shaKey(ref: PRRef): string {
   return `${ref.owner}/${ref.repo}#${ref.number}`;
+}
+
+/**
+ * Normalize a GitHub PR/issue payload to one of OPEN | DRAFT | MERGED | CLOSED.
+ * Search API returns issue-shape (state=open|closed, pull_request.merged_at);
+ * pulls API returns PR-shape (state, draft, merged_at, merged).
+ */
+function ghForgeState(p: any): 'OPEN' | 'DRAFT' | 'MERGED' | 'CLOSED' {
+  const mergedAt = p.merged_at ?? p.pull_request?.merged_at;
+  if (mergedAt || p.merged === true) return 'MERGED';
+  if ((p.draft ?? p.pull_request?.draft) === true) return 'DRAFT';
+  if (p.state === 'closed') return 'CLOSED';
+  return 'OPEN';
 }
 
 type ScopeQuery =
