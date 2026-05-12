@@ -1,7 +1,17 @@
 import { execa } from 'execa';
 import readline from 'node:readline';
+import os from 'node:os';
 import { ReviewInput, ReviewOutput, ReviewOutputSchema, Provider, ReviewOpts, AgentEvent } from './types.js';
 import { buildPrompt } from '../prompt.js';
+
+/** Append platform-specific binary dirs that Node may not inherit from the shell. */
+function augmentedPath(): string {
+  const base = process.env.PATH ?? '';
+  const extra = os.platform() === 'darwin'
+    ? ['/opt/homebrew/bin', '/usr/local/bin']  // Homebrew (Apple Silicon + Intel)
+    : [];
+  return [base, ...extra].filter(Boolean).join(':');
+}
 
 export class GeminiProvider implements Provider {
   name = 'gemini' as const;
@@ -30,6 +40,7 @@ export class GeminiProvider implements Provider {
       timeout: 10 * 60_000,
       maxBuffer: 50 * 1024 * 1024,
       cancelSignal: opts.signal,
+      env: { ...process.env, PATH: augmentedPath() },
     });
 
     if (useStream && sub.stdout) {

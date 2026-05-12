@@ -15,6 +15,18 @@ import { queryBlastRadius, formatBlastRadius } from '../indexer.js';
 import { detectRepoRoot } from '../local_diff.js';
 import { detectCrossPatterns, formatPatternReport } from '../pattern_detect.js';
 
+/** Join per-file annotated diffs, hard-capping at maxChars. Each file gets
+ *  an equal share; files that exceed their share are truncated with a notice. */
+function capDiff(annotated: string[], maxChars: number): string {
+  if (annotated.length === 0) return '';
+  const share = Math.floor(maxChars / annotated.length);
+  const parts = annotated.map((d) => {
+    if (d.length <= share) return d;
+    return d.slice(0, share) + `\n[... diff truncated — ${d.length - share} chars omitted to stay within context limit ...]\n`;
+  });
+  return parts.join('');
+}
+
 class Logger {
   lines: string[] = [];
   constructor(private onLog?: (msg: string) => void) {}
@@ -38,6 +50,8 @@ export interface PipelineOpts {
   onAgentEvent?: (stage: string, e: AgentEvent) => void;
   signal?: AbortSignal;
   repoRoot?: string;
+  /** Max total diff characters sent to the review model (default 80 000 ≈ 20 K tokens). */
+  maxDiffChars?: number;
   /** Existing reviewer comments from the forge — already-said human signal
    *  the model should not duplicate. Caller queries reviewer_comment and
    *  hands them in so the pipeline stays free of DB-shape concerns. */
@@ -140,7 +154,9 @@ export async function runAnalysisPipeline(
 
   const keepPaths = new Set(triageItems.filter((t) => t.decision !== 'skip').map((t) => t.path));
   const reviewableFiles = fileDiffs.filter((f) => keepPaths.has(f.path));
-  const reviewableDiff = reviewableFiles.map((f) => annotateDiff(f.body)).join('');
+  const maxDiffChars = opts.maxDiffChars ?? 80_000;
+  const reviewableDiff = capDiff(reviewableFiles.map((f) => annotateDiff(f.body)), maxDiffChars);
+  logger.log(`diff: ${reviewableDiff.length} chars (cap ${maxDiffChars}) across ${reviewableFiles.length} file(s)`);
 
   if (reviewableFiles.length === 0) {
     logger.log('All files triaged as skip. Nothing to review.');
