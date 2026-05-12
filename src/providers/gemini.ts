@@ -27,12 +27,14 @@ export class GeminiProvider implements Provider {
 
   async review(input: ReviewInput, opts: ReviewOpts = {}): Promise<ReviewOutput> {
     const prompt = input.prompt && input.prompt.length > 0 ? input.prompt : buildPrompt('gemini', input, input.lenses);
-    // -p '' triggers headless mode; the CLI appends that empty string to stdin content.
-    // --approval-mode plan = read-only agent mode: no file writes, exits cleanly after responding.
-    // Do NOT add -o stream-json: that flag activates the full agentic tool-call loop (file reads,
-    // multi-turn planning) which balloons runtime to 5-10 min. Headless + plan mode alone is a
-    // single-pass completion that finishes in under a minute.
-    const args = ['-p', '', '--approval-mode', 'plan'];
+    // -p '' triggers headless (non-interactive) mode; stdin carries the actual prompt text.
+    // -o json requests a single structured response — no streaming, no multi-turn loop.
+    // We deliberately omit --approval-mode: without it the CLI uses default approval mode,
+    // which prompts interactively before any tool call. In headless mode that prompt can never
+    // be answered, so tool calls are blocked and the model falls back to a direct LLM response.
+    // Do NOT add --approval-mode plan: it auto-approves read-only tools (grep, file reads) which
+    // triggers the full agentic loop and balloons runtime to 5-10 min.
+    const args = ['-p', '', '-o', 'json'];
     if (opts.model) args.push('--model', opts.model);
 
     opts.onAgentEvent?.({ kind: 'status', phase: 'started', ts: Date.now() });
@@ -51,19 +53,37 @@ export class GeminiProvider implements Provider {
       throw err;
     }
     opts.onAgentEvent?.({ kind: 'status', phase: 'ended', ts: Date.now() });
-
-    const usage = {
-      tokens_in: Math.ceil(prompt.length / 4),
-      tokens_out: Math.ceil(stdout.length / 4),
-      source: 'estimated' as const,
-    };
-    const json = extractJsonBlock(stdout);
-    const parsed = ReviewOutputSchema.safeParse(json);
-    if (!parsed.success) {
-      return { summary: '', comments: [], rawResponse: stdout, usage } as ReviewOutput;
-    }
-    return { ...parsed.data, rawResponse: stdout, usage };
+    return parseGeminiJsonOutput(stdout);
   }
+}
+
+/** Parse the -o json envelope: {"session_id":…,"response":"<model text>","stats":{…}} */
+function parseGeminiJsonOutput(stdout: string): ReviewOutput {
+  let text = stdout;
+  let usage: ReviewOutput['usage'];
+
+  try {
+    const wrapper = JSON.parse(stdout);
+    if (wrapper.response && typeof wrapper.response === 'string') {
+      text = wrapper.response;
+    }
+    const model = wrapper.stats?.models ? Object.values(wrapper.stats.models)[0] as any : null;
+    const tokens = model?.tokens;
+    if (tokens) {
+      usage = { tokens_in: tokens.input ?? 0, tokens_out: tokens.candidates ?? 0, source: 'reported' };
+    }
+  } catch { /* stdout isn't the envelope — fall through to raw parse */ }
+
+  if (!usage) {
+    usage = { tokens_in: Math.ceil(stdout.length / 4), tokens_out: 0, source: 'estimated' };
+  }
+
+  const json = extractJsonBlock(text);
+  const parsed = ReviewOutputSchema.safeParse(json);
+  if (!parsed.success) {
+    return { summary: '', comments: [], rawResponse: stdout, usage } as ReviewOutput;
+  }
+  return { ...parsed.data, rawResponse: stdout, usage };
 }
 
 function extractJsonBlock(text: string): unknown {
