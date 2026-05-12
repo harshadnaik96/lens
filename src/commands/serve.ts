@@ -288,7 +288,7 @@ export async function serve(cfg: Config, port: number) {
     // Open a new review_session row. Every analyze/reanalyze gets its own id.
     const sessionRes = db.prepare(
       `INSERT INTO review_session (pr_id, trigger, provider, model, status) VALUES (?, ?, ?, ?, 'running')`,
-    ).run(prId, 'analyze', cfg.provider ?? null, (cfg as any)?.model ?? null);
+    ).run(prId, 'analyze', cfg.provider?.default ?? null, (cfg as any)?.model ?? null);
     const sessionId = Number(sessionRes.lastInsertRowid);
     activeSessions.set(prId, { id: sessionId, seq: 0 });
     persistEvent(prId, 'session_start', { prId, startedAt: state.startedAt });
@@ -561,11 +561,11 @@ export async function serve(cfg: Config, port: number) {
         const drafts = db
           .prepare(`SELECT * FROM comment_draft WHERE analysis_id=? AND action != 'deleted' ORDER BY id`)
           .all(a.id) as Array<any>;
-        const footer = cfg.reviewer.botFooter.replace('{name}', cfg.reviewer.name);
+        // const footer = cfg.reviewer.botFooter.replace('{name}', cfg.reviewer.name);
         let posted = 0;
         const errors: string[] = [];
         for (const d of drafts) {
-          const body = `${d.current_body}\n\n_${footer}_`;
+          const body = d.current_body;
           try {
             await bb.postInlineComment(idToRef(prId), d.file, d.line, d.side ?? 'new', body);
             posted++;
@@ -716,8 +716,13 @@ export async function serve(cfg: Config, port: number) {
       res.writeHead(404);
       res.end('not found');
     } catch (err: any) {
-      res.writeHead(500, { 'Content-Type': 'text/plain' });
-      res.end(String(err.message ?? err));
+      console.error('[serve] request error:', req.url, err?.message ?? err);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end(String(err.message ?? err));
+      } else if (!res.writableEnded) {
+        res.end();
+      }
     }
   });
 
@@ -1729,7 +1734,7 @@ function renderCostDrawer(stages: any[], analysis: any): string {
   <div class="side-drawer" id="cost-drawer">
     <div class="side-drawer-header">
       <h3 class="h4 m-0">Cost & Token Breakdown</h3>
-      <button class="btn-link text-small" onclick="closeDrawer()" style="color:var(--fg-muted); text-decoration:none;">Close</button>
+      <button onclick="closeDrawer()" title="Close (Esc)" style="background:none;border:1px solid var(--border);cursor:pointer;padding:4px 10px;border-radius:6px;color:var(--fg);font-size:16px;line-height:1;display:flex;align-items:center;font-weight:600;" onmouseover="this.style.background='var(--border)'" onmouseout="this.style.background='none'">&#x2715;</button>
     </div>
     <div class="side-drawer-body" style="padding: 24px;">
       ${stages.length === 0 ? '<p class="color-fg-muted">No per-stage usage logged yet.</p>' : `
@@ -1864,12 +1869,15 @@ function renderPR(db: ReturnType<typeof getDb>, prId: string): string {
 
     <main class="MainView">
       <div class="MainView-content">
-        <div class="Box mb-4" style="background: rgba(250,250,250,0.3);">          <div class="Box-header d-flex flex-items-center gap-2" style="background:transparent; border-bottom:none; padding-bottom:4px;">
+        <div class="Box mb-4" style="background: rgba(250,250,250,0.3);">
+          <div class="Box-header d-flex flex-items-center gap-2" style="background:transparent; border-bottom:none; padding-bottom:4px; cursor:pointer; user-select:none;" onclick="toggleSummary()">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
-            <h3 class="Box-title" style="font-size:16px;">AI Review Summary</h3>
+            <h3 class="Box-title" style="font-size:16px; flex:1;">AI Review Summary</h3>
+            <svg id="summary-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--fg-muted)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="transition:transform 0.2s;"><polyline points="6 9 12 15 18 9"/></svg>
           </div>
-          <div class="Box-body text-small color-fg-muted" id="review-summary" style="white-space: pre-wrap; padding-top:0; padding-bottom:20px; line-height: 1.5;">${escape(analysis?.summary ?? 'No analysis yet.')}</div>
-          
+          <div id="summary-body">
+            <div class="Box-body text-small color-fg-muted" id="review-summary" style="white-space: pre-wrap; padding-top:0; padding-bottom:20px; line-height: 1.5;">${escape(analysis?.summary ?? 'No analysis yet.')}</div>
+          </div>
           <div class="Box-footer" style="background:transparent; border-top: 1px dashed var(--border); padding: 12px 20px; display:flex; gap:12px; align-items:center;">
             <button class="btn btn-sm btn-outline text-small d-flex flex-items-center gap-2" onclick="openDrawer('logs-drawer')">
               Thinking Logs
@@ -1910,7 +1918,7 @@ function renderPR(db: ReturnType<typeof getDb>, prId: string): string {
       <div style="display:flex; gap:8px; align-items:center;">
         <button class="btn-link text-small logs-tab is-active" data-tab="timeline" style="text-decoration:none;">Timeline</button>
         <button class="btn-link text-small logs-tab" data-tab="raw" style="text-decoration:none; color:var(--fg-muted);">Raw</button>
-        <button class="btn-link text-small" onclick="closeDrawer()" style="color:var(--fg-muted); text-decoration:none;">Close</button>
+        <button onclick="closeDrawer()" title="Close (Esc)" style="background:none;border:1px solid var(--border);cursor:pointer;padding:4px 10px;border-radius:6px;color:var(--fg);font-size:16px;line-height:1;display:flex;align-items:center;font-weight:600;" onmouseover="this.style.background='var(--border)'" onmouseout="this.style.background='none'">&#x2715;</button>
       </div>
     </div>
     <div class="side-drawer-body p-0">
@@ -1933,7 +1941,7 @@ function renderPR(db: ReturnType<typeof getDb>, prId: string): string {
   <div class="side-drawer" id="triage-drawer">
     <div class="side-drawer-header">
       <h3 class="h4 m-0">Triage Analysis</h3>
-      <button class="btn-link text-small" onclick="closeDrawer()" style="color:var(--fg-muted); text-decoration:none;">Close</button>
+      <button onclick="closeDrawer()" title="Close (Esc)" style="background:none;border:1px solid var(--border);cursor:pointer;padding:4px 10px;border-radius:6px;color:var(--fg);font-size:16px;line-height:1;display:flex;align-items:center;font-weight:600;" onmouseover="this.style.background='var(--border)'" onmouseout="this.style.background='none'">&#x2715;</button>
     </div>
     <div class="side-drawer-body p-0" style="overflow-y:auto;">
       <table class="triage-table text-small" style="margin:0;">
@@ -1956,7 +1964,7 @@ function renderPR(db: ReturnType<typeof getDb>, prId: string): string {
   <div class="side-drawer" id="existing-comments-drawer">
     <div class="side-drawer-header">
       <h3 class="h4 m-0">Existing Reviewer Comments</h3>
-      <button class="btn-link text-small" onclick="closeDrawer()" style="color:var(--fg-muted); text-decoration:none;">Close</button>
+      <button onclick="closeDrawer()" title="Close (Esc)" style="background:none;border:1px solid var(--border);cursor:pointer;padding:4px 10px;border-radius:6px;color:var(--fg);font-size:16px;line-height:1;display:flex;align-items:center;font-weight:600;" onmouseover="this.style.background='var(--border)'" onmouseout="this.style.background='none'">&#x2715;</button>
     </div>
     <div class="side-drawer-body" style="overflow-y:auto; padding:0;">
       ${existingComments.length === 0 ? `<div style="padding:24px; color:var(--fg-muted); font-size:13px;">No reviewer comments synced yet. They land here on the next sync.</div>` :
@@ -1976,12 +1984,10 @@ function renderPR(db: ReturnType<typeof getDb>, prId: string): string {
   <div class="side-drawer" id="sessions-drawer" style="width:min(880px, 95vw);">
     <div class="side-drawer-header">
       <h3 class="h4 m-0" id="sessions-drawer-title">Past Runs</h3>
-      <button class="btn-link text-small" onclick="closeDrawer()" style="color:var(--fg-muted); text-decoration:none;">Close</button>
+      <button onclick="closeDrawer()" title="Close (Esc)" style="background:none;border:1px solid var(--border);cursor:pointer;padding:4px 10px;border-radius:6px;color:var(--fg);font-size:16px;line-height:1;display:flex;align-items:center;font-weight:600;" onmouseover="this.style.background='var(--border)'" onmouseout="this.style.background='none'">&#x2715;</button>
     </div>
     <div class="side-drawer-body p-0" style="display:grid; grid-template-columns: 280px 1fr; height:100%; overflow:hidden;">
-      <div id="sessions-list" style="border-right:1px solid var(--border); overflow-y:auto;">
-        <div style="padding:18px; color:var(--fg-muted); font-size:13px;">Loading…</div>
-      </div>
+      <div id="sessions-list" style="border-right:1px solid var(--border); overflow-y:auto;"></div>
       <div id="sessions-detail" style="overflow-y:auto; padding:14px 18px;">
         <div style="color:var(--fg-muted); font-size:13px;">Pick a run on the left to replay its events.</div>
       </div>
@@ -2379,6 +2385,15 @@ function renderPR(db: ReturnType<typeof getDb>, prId: string): string {
       });
     }
 
+    function toggleSummary() {
+      const body = document.getElementById('summary-body');
+      const chevron = document.getElementById('summary-chevron');
+      if (!body) return;
+      const collapsed = body.style.display === 'none';
+      body.style.display = collapsed ? '' : 'none';
+      if (chevron) chevron.style.transform = collapsed ? '' : 'rotate(-90deg)';
+    }
+
     function toggleSidebar() {
       document.getElementById('sidebar').classList.toggle('is-collapsed');
       document.body.classList.toggle('sidebar-collapsed');
@@ -2393,6 +2408,7 @@ function renderPR(db: ReturnType<typeof getDb>, prId: string): string {
       document.getElementById('drawer-backdrop').classList.remove('is-open');
       document.querySelectorAll('.side-drawer').forEach(d => d.classList.remove('is-open'));
     }
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
 
     async function openSessionsDrawer() {
       openDrawer('sessions-drawer');
@@ -2400,7 +2416,7 @@ function renderPR(db: ReturnType<typeof getDb>, prId: string): string {
       const detail = document.getElementById('sessions-detail');
       list.innerHTML = '<div style="padding:18px; color:var(--fg-muted); font-size:13px;">Loading…</div>';
       try {
-        const res = await fetch('/api/pr/' + encodeURIComponent(PRID) + '/sessions');
+        const res = await fetch('/api/pr/' + PRID + '/sessions');
         const rows = await res.json();
         if (!Array.isArray(rows) || rows.length === 0) {
           list.innerHTML = '<div style="padding:18px; color:var(--fg-muted); font-size:13px;">No sessions yet. Trigger an analyze to start one.</div>';
@@ -3297,7 +3313,7 @@ const BASE_CSS = `<style>
   .file-comment-badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; cursor: default; margin-left: auto; flex-shrink: 0; }
 
   /* Drawers */
-  .side-drawer { position: fixed; top: 0; right: -600px; width: 600px; height: 100vh; background: var(--bg); box-shadow: -4px 0 24px rgba(0,0,0,0.1); z-index: 1000; transition: right 0.3s cubic-bezier(0.4, 0, 0.2, 1); display: flex; flex-direction: column; border-left: 1px solid var(--border); }
+  .side-drawer { position: fixed; top: 0; right: -100vw; width: 600px; height: 100vh; background: var(--bg); box-shadow: -4px 0 24px rgba(0,0,0,0.1); z-index: 1000; transition: right 0.3s cubic-bezier(0.4, 0, 0.2, 1); display: flex; flex-direction: column; border-left: 1px solid var(--border); }
   .side-drawer.is-open { right: 0; }
   .side-drawer-header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: rgba(250,250,250,0.5); }
   .side-drawer-body { overflow-y: auto; flex: 1; }

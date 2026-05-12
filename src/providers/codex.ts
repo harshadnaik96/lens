@@ -32,7 +32,7 @@ export class CodexProvider implements Provider {
     args.push(prompt);
 
     const sub = execa(this.bin, args, {
-      timeout: 5 * 60_000,
+      timeout: 15 * 60_000,
       maxBuffer: 50 * 1024 * 1024,
       cancelSignal: opts.signal,
     });
@@ -92,11 +92,54 @@ function handleCodexEvent(
   emit: (e: AgentEvent) => void,
 ): { assistantText?: string; usage?: { tokens_in: number; tokens_out: number } } | undefined {
   if (!ev || typeof ev !== 'object') return;
-  // Codex JSONL events come wrapped: { id, msg: { type, ... } } in newer versions,
-  // but older ones may flatten { type, ... } at the top level. Handle both.
-  const msg = ev.msg ?? ev;
-  const type = msg.type ?? ev.type;
   const ts = Date.now();
+  const type: string = ev.type ?? '';
+
+  // ── v0.130+ event format ──────────────────────────────────────────────────
+  // item.completed wraps all content items (messages, tool calls, outputs).
+  if (type === 'item.completed') {
+    const item = ev.item;
+    if (!item) return;
+    switch (item.type) {
+      case 'agent_message':
+      case 'assistant_message':
+      case 'message': {
+        const text = item.text ?? item.content ?? item.message ?? '';
+        if (text) emit({ kind: 'text', text: String(text), ts });
+        return { assistantText: String(text) };
+      }
+      case 'reasoning': {
+        const text = item.text ?? item.content ?? '';
+        if (text) emit({ kind: 'thinking', text: String(text), ts });
+        return;
+      }
+      case 'function_call':
+      case 'tool_call': {
+        emit({ kind: 'tool_use', name: String(item.name ?? item.tool ?? '?'), input: item.arguments ?? item.input, toolId: item.call_id ?? item.id, ts });
+        return;
+      }
+      case 'function_call_output':
+      case 'tool_result': {
+        const out = item.output ?? item.content ?? '';
+        emit({ kind: 'tool_result', toolId: item.call_id ?? item.id, ok: !item.error, summary: typeof out === 'string' ? out.slice(0, 400) : '', ts });
+        return;
+      }
+    }
+    return;
+  }
+
+  if (type === 'turn.completed') {
+    const u = ev.usage;
+    if (u) {
+      const tIn = u.input_tokens ?? u.prompt_tokens ?? 0;
+      const tOut = u.output_tokens ?? u.completion_tokens ?? 0;
+      if (tIn || tOut) return { usage: { tokens_in: tIn, tokens_out: tOut } };
+    }
+    return;
+  }
+
+  // ── legacy event format (pre-v0.130) ─────────────────────────────────────
+  const msg = ev.msg ?? ev;
   switch (type) {
     case 'agent_message':
     case 'assistant_message': {
@@ -114,16 +157,14 @@ function handleCodexEvent(
     case 'tool_call':
     case 'tool_use': {
       const name = type === 'exec_command_begin' ? 'shell' : (msg.name ?? msg.tool ?? '?');
-      const input = msg.command ?? msg.input ?? msg.args;
-      emit({ kind: 'tool_use', name: String(name), input, toolId: msg.call_id ?? msg.id, ts });
+      emit({ kind: 'tool_use', name: String(name), input: msg.command ?? msg.input ?? msg.args, toolId: msg.call_id ?? msg.id, ts });
       return;
     }
     case 'exec_command_end':
     case 'tool_result': {
       const ok = type === 'exec_command_end' ? (msg.exit_code === 0) : (msg.status !== 'error' && !msg.is_error);
       const out = msg.stdout ?? msg.output ?? msg.content ?? '';
-      const summary = typeof out === 'string' ? out.slice(0, 400) : '';
-      emit({ kind: 'tool_result', toolId: msg.call_id ?? msg.id, ok, summary, ts });
+      emit({ kind: 'tool_result', toolId: msg.call_id ?? msg.id, ok, summary: typeof out === 'string' ? out.slice(0, 400) : '', ts });
       return;
     }
     case 'token_count':
@@ -134,14 +175,12 @@ function handleCodexEvent(
       return;
     }
     case 'task_complete': {
-      // emit the final assistant message if present and not already streamed
       const last = msg.last_agent_message;
       if (last) return { assistantText: String(last) };
       return;
     }
-    default:
-      return;
   }
+  return;
 }
 
 function extractJsonBlock(text: string): unknown {

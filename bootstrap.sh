@@ -27,26 +27,46 @@ if [ "$NODE_MAJOR" -lt 20 ]; then
 fi
 green "✓ Node $(node -v)"
 
-# 2. npm install
+# 2. ripgrep check / install
+if ! command -v rg >/dev/null 2>&1; then
+  bold "→ Installing ripgrep..."
+  if command -v brew >/dev/null 2>&1; then
+    brew install ripgrep
+  elif command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get install -y ripgrep
+  elif command -v dnf >/dev/null 2>&1; then
+    sudo dnf install -y ripgrep
+  else
+    red "ripgrep not found and no supported package manager (brew/apt/dnf) detected."
+    red "Install ripgrep manually: https://github.com/BurntSushi/ripgrep#installation"
+    exit 1
+  fi
+fi
+green "✓ ripgrep $(rg --version | head -1 | awk '{print $2}')"
+
+# 3. npm install
 bold "→ Installing dependencies..."
 npm install --silent
 green "✓ deps installed"
 
-# 3. build
+# 4. build
 bold "→ Building..."
 npm run build --silent
 green "✓ built dist/"
 
-# 4. npm link
-bold "→ Linking the \`lens\` command globally..."
-if npm link >/dev/null 2>&1; then
-  green "✓ lens command available on PATH"
-else
-  dim "(npm link needed sudo on this system — retrying)"
-  sudo npm link
-  green "✓ lens command available on PATH"
-fi
+# Rebuild native addons for the current Node version
+npm rebuild --silent
+green "✓ native addons compiled"
 
-# 5. interactive setup
+# 5. link the lens binary onto PATH
+bold "→ Linking the \`lens\` command globally..."
+LENS_BIN="$(pwd)/dist/cli.js"
+LINK_DIR="$HOME/.local/bin"
+mkdir -p "$LINK_DIR"
+printf '#!/usr/bin/env bash\nexec node "%s" "$@"\n' "$LENS_BIN" > "$LINK_DIR/lens"
+chmod +x "$LINK_DIR/lens"
+green "✓ lens command available on PATH (~/.local/bin/lens)"
+
+# 6. interactive setup
 bold "→ Launching interactive setup..."
-exec lens setup
+exec node dist/cli.js setup

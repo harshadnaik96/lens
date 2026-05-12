@@ -1,14 +1,14 @@
-import Database from 'better-sqlite3';
-import fs from 'node:fs';
-import path from 'node:path';
-import { DB_PATH, LENS_HOME } from './config.js';
+import Database from "better-sqlite3";
+import fs from "node:fs";
+import path from "node:path";
+import { DB_PATH, LENS_HOME } from "./config.js";
 
 let _db: Database.Database | null = null;
 
 export function initDb(): Database.Database {
   fs.mkdirSync(LENS_HOME, { recursive: true });
   const db = new Database(DB_PATH);
-  db.pragma('journal_mode = WAL');
+  db.pragma("journal_mode = WAL");
   db.exec(`
     CREATE TABLE IF NOT EXISTS pr (
       id TEXT PRIMARY KEY,
@@ -168,6 +168,13 @@ export function initDb(): Database.Database {
 
     CREATE INDEX IF NOT EXISTS idx_review_event_session
       ON review_event(session_id, seq);
+
+    CREATE TABLE IF NOT EXISTS project_path (
+      workspace TEXT NOT NULL,
+      repo TEXT NOT NULL,
+      local_path TEXT NOT NULL,
+      PRIMARY KEY (workspace, repo)
+    );
   `);
 
   // Defensive ALTERs for existing dbs upgraded from older schema.
@@ -190,7 +197,11 @@ export function initDb(): Database.Database {
     `ALTER TABLE pr ADD COLUMN is_draft INTEGER DEFAULT 0`,
     `ALTER TABLE reviewer_comment ADD COLUMN created_at TEXT`,
   ]) {
-    try { db.exec(stmt); } catch { /* column already exists */ }
+    try {
+      db.exec(stmt);
+    } catch {
+      /* column already exists */
+    }
   }
 
   _db = db;
