@@ -28,13 +28,16 @@ export class GeminiProvider implements Provider {
   async review(input: ReviewInput, opts: ReviewOpts = {}): Promise<ReviewOutput> {
     const prompt = input.prompt && input.prompt.length > 0 ? input.prompt : buildPrompt('gemini', input, input.lenses);
     // -p '' triggers headless (non-interactive) mode; stdin carries the actual prompt text.
+    // --skip-trust bypasses the Gemini CLI workspace-trust check. Without it the CLI blocks
+    // waiting for interactive trust confirmation when run from an untrusted directory (any
+    // directory not previously trusted by the user — common on Linux servers).
     // -o json requests a single structured response — no streaming, no multi-turn loop.
     // We deliberately omit --approval-mode: without it the CLI uses default approval mode,
     // which prompts interactively before any tool call. In headless mode that prompt can never
     // be answered, so tool calls are blocked and the model falls back to a direct LLM response.
     // Do NOT add --approval-mode plan: it auto-approves read-only tools (grep, file reads) which
     // triggers the full agentic loop and balloons runtime to 5-10 min.
-    const args = ['-p', '', '-o', 'json'];
+    const args = ['-p', '', '--skip-trust', '-o', 'json'];
     if (opts.model) args.push('--model', opts.model);
 
     opts.onAgentEvent?.({ kind: 'status', phase: 'started', ts: Date.now() });
